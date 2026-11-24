@@ -2236,7 +2236,7 @@ struct MitmRow {
 struct MitmPair {
     uint64_t fingerprint;
     uint32_t left, right;
-    int rotation;
+    int left_rotation, right_rotation;
 };
 
 // The multiplicative quotient by <U,-1> permutes the nonzero PAF shifts.
@@ -2302,6 +2302,21 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
         return rotated;
     };
 
+    auto pair_anchor = [K](const MitmRow& a, const MitmRow& b, int relative, int sign) {
+        const int* first = a.paf.data();
+        const int* second = b.paf.data() + relative;
+        int best = 0;
+        for (int k = 1; k < K; ++k) {
+            int difference = first[k] + second[k] - first[best] - second[best];
+            for (int j = 1; difference == 0 && j < K; ++j) {
+                difference = first[k + j] + second[k + j] -
+                             first[best + j] - second[best + j];
+            }
+            if (sign * difference < 0) best = k;
+        }
+        return best;
+    };
+
     std::vector<MitmRow> pools[4];
     std::set<std::vector<int>> seen[4];
     uint64_t attempts[4] = {};
@@ -2339,6 +2354,11 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
                 fingerprints[k] += coefficients[j] * (uint64_t)paf[(k + j) % K];
             }
         }
+        // Three copies cover every contiguous window of length K at any
+        // relative shift and joint rotation without modulo in comparisons.
+        paf.resize(3 * K);
+        std::copy_n(paf.begin(), K, paf.begin() + K);
+        std::copy_n(paf.begin(), K, paf.begin() + 2 * K);
         pools[s].push_back({rotate_signs(signs, canonical), std::move(paf), std::move(fingerprints)});
         return true;
     };
@@ -2389,7 +2409,7 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
     for (int s = 0; s < 4; ++s) {
         int64_t min_flat = INT64_MAX, max_flat = 0;
         for (const auto& row : pools[s]) {
-            int64_t flat = std::inner_product(row.paf.begin(), row.paf.end(), row.paf.begin(), int64_t{0});
+            int64_t flat = std::inner_product(row.paf.begin(), row.paf.begin() + K, row.paf.begin(), int64_t{0});
             min_flat = std::min(min_flat, flat);
             max_flat = std::max(max_flat, flat);
         }
@@ -2410,8 +2430,12 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
     table.reserve(pools[0].size() * pools[1].size() * K);
     for (uint32_t a = 0; a < pools[0].size() && elapsed() < seconds; ++a) {
         for (uint32_t b = 0; b < pools[1].size(); ++b) {
-            for (int k = 0; k < K; ++k) {
-                table.push_back({pools[0][a].fingerprints[0] + pools[1][b].fingerprints[k], a, b, k});
+            const auto& left = pools[0][a];
+            const auto& right = pools[1][b];
+            for (int relative = 0; relative < K; ++relative) {
+                int kl = pair_anchor(left, right, relative, 1);
+                int kr = (kl + relative) % K;
+                table.push_back({left.fingerprints[kl] + right.fingerprints[kr], a, b, kl, kr});
             }
         }
     }
@@ -2442,44 +2466,46 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
                   << ", probe_seconds=" << elapsed() - match_start - build_seconds << std::endl;
     };
 
-    // Fix the first row's rotation. Enumerate all three relative rotations of
-    // the other rows so this symmetry reduction preserves every possible match.
+    // Joint cyclic rotations act on both members of a pair. Canonicalize
+    // each pair under this action while enumerating all relative rotations.
+    // On the probing side canonicalize the negated sum, so complement
+    // vectors yield the same canonical form even when tied at a minimum.
     for (const auto& c : pools[2]) {
         for (const auto& d : pools[3]) {
             if (elapsed() >= seconds) {
                 report();
                 return 2;
             }
-            for (int kc = 0; kc < K; ++kc) {
-                for (int kd = 0; kd < K; ++kd) {
-                    ++probes;
-                    uint64_t key = 0 - (c.fingerprints[kc] + d.fingerprints[kd]);
-                    size_t bucket = key >> (64 - prefix_bits);
-                    auto end = table.begin() + buckets[bucket + 1];
-                    auto it = std::lower_bound(table.begin() + buckets[bucket], end, key,
-                        [](const MitmPair& pair, uint64_t value) { return pair.fingerprint < value; });
-                    for (; it != end && it->fingerprint == key; ++it) {
-                        const auto& a = pools[0][it->left];
-                        const auto& b = pools[1][it->right];
-                        bool exact = true;
-                        for (int j = 0; j < K; ++j) {
-                            if (a.paf[j] + b.paf[(it->rotation + j) % K] +
-                                c.paf[(kc + j) % K] + d.paf[(kd + j) % K] != 0) {
-                                exact = false;
-                                break;
-                            }
+            for (int relative = 0; relative < K; ++relative) {
+                ++probes;
+                int kc = pair_anchor(c, d, relative, -1);
+                int kd = (kc + relative) % K;
+                uint64_t key = 0 - (c.fingerprints[kc] + d.fingerprints[kd]);
+                size_t bucket = key >> (64 - prefix_bits);
+                auto end = table.begin() + buckets[bucket + 1];
+                auto it = std::lower_bound(table.begin() + buckets[bucket], end, key,
+                    [](const MitmPair& pair, uint64_t value) { return pair.fingerprint < value; });
+                for (; it != end && it->fingerprint == key; ++it) {
+                    const auto& a = pools[0][it->left];
+                    const auto& b = pools[1][it->right];
+                    int ka = it->left_rotation, kb = it->right_rotation;
+                    bool exact = true;
+                    for (int j = 0; j < K; ++j) {
+                        if (a.paf[ka + j] + b.paf[kb + j] + c.paf[kc + j] + d.paf[kd + j] != 0) {
+                            exact = false;
+                            break;
                         }
-                        if (!exact) continue;
-                        st.seq[0] = a.signs;
-                        st.seq[1] = rotate_signs(b.signs, it->rotation);
-                        st.seq[2] = rotate_signs(c.signs, kc);
-                        st.seq[3] = rotate_signs(d.signs, kd);
-                        st.recompute();
-                        record_if_best(0, "MITM", prob, st, start, out_path);
-                        if (g_found.load(std::memory_order_relaxed)) {
-                            report();
-                            return 0;
-                        }
+                    }
+                    if (!exact) continue;
+                    st.seq[0] = rotate_signs(a.signs, ka);
+                    st.seq[1] = rotate_signs(b.signs, kb);
+                    st.seq[2] = rotate_signs(c.signs, kc);
+                    st.seq[3] = rotate_signs(d.signs, kd);
+                    st.recompute();
+                    record_if_best(0, "MITM", prob, st, start, out_path);
+                    if (g_found.load(std::memory_order_relaxed)) {
+                        report();
+                        return 0;
                     }
                 }
             }
