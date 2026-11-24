@@ -95,7 +95,7 @@ int main() {
     // Cache full entries by (sf, is_d0)
     std::unordered_map<int64_t, std::vector<FullEntry>> cache_L;
     auto get_L = [&](int sf, int is_d0) -> const std::vector<FullEntry>& {
-        int64_t key = ((int64_t)sf << 1) | is_d0;
+        int64_t key = 2 * static_cast<int64_t>(sf) + is_d0;
         auto it = cache_L.find(key);
         if (it != cache_L.end()) return it->second;
 
@@ -170,6 +170,7 @@ int main() {
         return cache_L[key] = std::move(uniq);
     };
 
+    bool skipped = false;
     for (int qi = 0; qi < num_rqs; ++qi) {
         auto rq = rqs[qi];
         const auto& L0 = get_L(rq[0], 1);
@@ -193,6 +194,7 @@ int main() {
         size_t szAB = A.size() * B.size();
         if (szAB > 120000000ULL) {
             std::cout << "  SKIPPED (|A|*|B|=" << szAB << " too large)\n";
+            skipped = true;
             continue;
         }
         std::vector<uint64_t> hashes;
@@ -240,6 +242,10 @@ int main() {
             }
         }
         if (found) return 0;
+    }
+    if (skipped) {
+        std::cout << "INCONCLUSIVE" << std::endl;
+        return 2;
     }
     std::cout << "EXHAUSTIVELY_IMPOSSIBLE" << std::endl;
     return 0;
