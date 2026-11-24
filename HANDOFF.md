@@ -139,6 +139,19 @@ g++ -std=c++20 -O3 -march=native -pthread tmatrix_solver.cpp -o tmatrix_solver
   norm leaves at most `2^29 - 1` fourth-row projections before the row
   size and integer autocorrelation checks. Both models recovered the
   published order-1948 rows used for calibration.
+- **Exact one-row repairs at 4412.** For each missing row of the saved
+  `E=864` candidate, `scan_binary_4412.cpp` exhausted all 536,870,911
+  nonzero projections and found zero completions. Each scan finished
+  in 12–14 seconds on one thread and had zero survivors by its sixth
+  integer autocorrelation check. The sum of squared row sums fixes the
+  missing absolute row sum, and negating a row preserves its
+  autocorrelations. The result covers all four triples in the saved
+  candidate under the order-19 multiplier symmetry.
+- **Order 7180, `g=29`.** A different cyclic subgroup of order 66 has
+  60 orbits and survived the bounded scan. `python3 analyze_7180_joint.py`
+  verifies one modulus-46 witness and rules out its extension to modulus 78
+  using the norm and shift 39. A separate sample passed those two
+  conditions, so the family remains unresolved.
 - **Meet-in-the-middle.** The paired solver generates individual rows
   with exact row sums and matches complementary autocorrelation vectors
   up to joint rotation. The injected order-1948 control passed
@@ -152,4 +165,16 @@ The order-4412 pair benchmark can be reproduced after building `solver_v3`.
 ```sh
 ./solver_v3 1103 749 0 90 /tmp/mitm-4412.json 1 --mode=mitm \
   --ts=1,37,39,39 --seed=4412 --mitm_pool=400 --mitm_flat_max=4400
+```
+
+To reproduce the exact scans, run from the repository root. A completed
+scan with no hit returns status 2.
+
+```sh
+g++ -std=c++20 -O3 -march=native scan_binary_4412.cpp -o /tmp/scan_binary_4412
+for row in 1 2 3 4; do
+  python3 analyze_4412.py fixtures/near_4412_seed4420.json --row "$row" \
+    --export-binary-scan "/tmp/4412-row-$row.txt"
+  /tmp/scan_binary_4412 "/tmp/4412-row-$row.txt"
+done
 ```
