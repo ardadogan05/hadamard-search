@@ -110,6 +110,7 @@ struct OrbitProblem {
     int64_t w_row = 64;
     int64_t w_alt = 16;
     bool lock_row = false;
+    bool flat_init = false;
     int max_orb_size = 1;
 
     bool infeasible = false;
@@ -125,6 +126,7 @@ struct OrbitProblem {
     std::vector<int> diag_const;
     int target_ac = 0;
     int target_s[4] = {2, 0, 0, 0};
+    std::vector<std::vector<int>> size_groups; // groups of orbits with identical size (len >= 2)
     std::vector<std::pair<int, int>> same_size_pairs;
     std::vector<std::pair<int, int>> same_size_same_alt_pairs;
     std::vector<OrbitTriple> row_preserving_triples;
@@ -166,7 +168,7 @@ static std::vector<int> close_subgroup(int m, const std::vector<int>& gens) {
 }
 
 OrbitProblem build_problem(int m, const std::vector<int>& gens, int b, const int ts[4],
-                           int64_t w_row, int64_t w_alt, bool lock_row,
+                           int64_t w_row, int64_t w_alt, bool lock_row, bool flat_init,
                            bool use_talt, const int talt[4]) {
     OrbitProblem prob;
     prob.m = m;
@@ -179,6 +181,7 @@ OrbitProblem build_problem(int m, const std::vector<int>& gens, int b, const int
     prob.w_row = w_row;
     prob.w_alt = prob.use_alt ? w_alt : 0;
     prob.lock_row = lock_row;
+    prob.flat_init = flat_init;
     prob.max_orb_size = 1;
     for (int s = 0; s < 4; ++s) {
         prob.target_s[s] = ts[s];
@@ -216,6 +219,22 @@ OrbitProblem build_problem(int m, const std::vector<int>& gens, int b, const int
                 if (prob.orb_alt[i] == prob.orb_alt[j]) {
                     prob.same_size_same_alt_pairs.push_back({i, j});
                 }
+            }
+        }
+    }
+
+    // Group orbits by size (for branchless pos x neg swap iteration)
+    {
+        std::vector<int> seen_sz;
+        for (int i = 0; i < prob.r; ++i) {
+            int sz = prob.orb_size[i];
+            if (std::find(seen_sz.begin(), seen_sz.end(), sz) == seen_sz.end()) {
+                seen_sz.push_back(sz);
+                std::vector<int> grp;
+                for (int j = 0; j < prob.r; ++j) {
+                    if (prob.orb_size[j] == sz) grp.push_back(j);
+                }
+                if (grp.size() >= 2) prob.size_groups.push_back(std::move(grp));
             }
         }
     }
@@ -436,6 +455,7 @@ bool exact_verify_sequences(const OrbitProblem& prob, const std::vector<int> seq
 std::atomic<bool> g_found{false};
 std::atomic<uint64_t> g_pt_steps{0};
 std::atomic<uint64_t> g_tabu_steps{0};
+std::atomic<uint64_t> g_two_opt_hits{0};
 std::atomic<int64_t> g_best_true_E{INT64_MAX};
 std::atomic<int64_t> g_best_rsum0_E{INT64_MAX};
 std::atomic<int64_t> g_best_manifold_E{INT64_MAX};
@@ -443,8 +463,40 @@ std::mutex g_io_mtx;
 std::vector<int> g_best_P;
 int g_best_rsum[4] = {0, 0, 0, 0};
 std::vector<int> g_best_rsum0_P;
+std::string g_save_best_path;
+int64_t g_two_opt_thresh = 2000;
 
-void save_witness(const std::string& path, const OrbitProblem& prob, const std::vector<int> seq[4]) {
+struct EliteEntry {
+    int64_t E;
+    std::vector<int> seq[4];
+};
+std::mutex g_elite_mtx;
+std::vector<EliteEntry> g_elite;
+static constexpr size_t MAX_ELITE = 8;
+
+void elite_try_insert(int64_t E, const std::vector<int> seq[4]) {
+    std::lock_guard<std::mutex> lk(g_elite_mtx);
+    if (g_elite.size() >= MAX_ELITE && E >= g_elite.back().E) return;
+    for (const auto& e : g_elite) {
+        if (e.E == E) {
+            bool same = true;
+            for (int s = 0; s < 4 && same; ++s) {
+                if (e.seq[s] != seq[s]) same = false;
+            }
+            if (same) return;
+        }
+    }
+    EliteEntry ent;
+    ent.E = E;
+    for (int s = 0; s < 4; ++s) ent.seq[s] = seq[s];
+    g_elite.push_back(std::move(ent));
+    std::sort(g_elite.begin(), g_elite.end(), [](const EliteEntry& a, const EliteEntry& b) {
+        return a.E < b.E;
+    });
+    if (g_elite.size() > MAX_ELITE) g_elite.resize(MAX_ELITE);
+}
+
+void save_witness(const std::string& path, const OrbitProblem& prob, const std::vector<int> seq[4], int64_t E_val = 0) {
     std::ofstream out(path);
     out << "{\n";
     out << "  \"n\": " << prob.n << ",\n";
@@ -460,6 +512,7 @@ void save_witness(const std::string& path, const OrbitProblem& prob, const std::
     out << "  \"b\": " << prob.b << ",\n";
     out << "  \"r\": " << prob.r << ",\n";
     out << "  \"K\": " << prob.K << ",\n";
+    out << "  \"E_ac\": " << E_val << ",\n";
     out << "  \"orbit_signs\": [\n";
     for (int s = 0; s < 4; ++s) {
         out << "    [";
@@ -610,6 +663,117 @@ struct SearchState {
         recompute();
     }
 
+    // Fast single-sequence flat-spectrum descent minimizing sum_k PAF_s(d_k)^2 (preserves rsum[s])
+    void flat_seed_single(int s, std::mt19937_64& rng, int max_steps = 120) {
+        if (prob->size_groups.empty()) return;
+        std::vector<int> Ps(Kpad, 0);
+        std::vector<int> gs((size_t)r * Kpad, 0);
+        for (int k = 0; k < K; ++k) {
+            int64_t pk = prob->diag_const[k];
+            int64_t acc = 0;
+            for (int i = 0; i < r; ++i) {
+                int64_t gval = 0;
+                const int* rowM = &prob->MT[((size_t)i * r) * Kpad];
+                for (int j = 0; j < r; ++j) {
+                    gval += (int64_t)rowM[(size_t)j * Kpad + k] * seq[s][j];
+                }
+                gs[(size_t)i * Kpad + k] = (int)gval;
+                acc += (int64_t)seq[s][i] * gval;
+            }
+            pk += acc / 2;
+            Ps[k] = (int)pk;
+        }
+
+        std::vector<int> pos, neg;
+        pos.reserve(r);
+        neg.reserve(r);
+        for (int step = 0; step < max_steps; ++step) {
+            int best_i = -1, best_j = -1;
+            int64_t best_d = 0;
+            int n_ties = 0;
+            const int* __restrict__ pptr = Ps.data();
+            for (const auto& grp : prob->size_groups) {
+                pos.clear();
+                neg.clear();
+                for (int idx : grp) {
+                    if (seq[s][idx] > 0) pos.push_back(idx);
+                    else neg.push_back(idx);
+                }
+                for (int i : pos) {
+                    const int* __restrict__ gi = &gs[(size_t)i * Kpad];
+                    for (int j : neg) {
+                        const int* __restrict__ gj = &gs[(size_t)j * Kpad];
+                        const int* __restrict__ mij = &prob->MT[((size_t)i * r + j) * Kpad];
+                        int64_t d = 0;
+#ifdef __AVX2__
+                        __m256i acc = _mm256_setzero_si256();
+                        for (int k = 0; k < Kpad; k += 8) {
+                            __m256i vgi = _mm256_loadu_si256((const __m256i*)(gi + k));
+                            __m256i vgj = _mm256_loadu_si256((const __m256i*)(gj + k));
+                            __m256i vmij = _mm256_loadu_si256((const __m256i*)(mij + k));
+                            __m256i vp = _mm256_loadu_si256((const __m256i*)(pptr + k));
+                            __m256i vdp = _mm256_sub_epi32(_mm256_slli_epi32(_mm256_sub_epi32(vgj, vgi), 1),
+                                                           _mm256_slli_epi32(vmij, 2));
+                            __m256i vsum = _mm256_add_epi32(_mm256_slli_epi32(vp, 1), vdp);
+                            __m256i ev = _mm256_mul_epi32(vdp, vsum);
+                            __m256i od = _mm256_mul_epi32(_mm256_srli_epi64(vdp, 32), _mm256_srli_epi64(vsum, 32));
+                            acc = _mm256_add_epi64(acc, _mm256_add_epi64(ev, od));
+                        }
+                        d = hsum_epi64(acc);
+#else
+                        for (int k = 0; k < Kpad; ++k) {
+                            int64_t dp = 2LL * (gj[k] - gi[k]) - 4LL * mij[k];
+                            d += dp * (2LL * pptr[k] + dp);
+                        }
+#endif
+                        if (d < best_d) {
+                            best_d = d; best_i = i; best_j = j; n_ties = 1;
+                        } else if (d == best_d && best_i != -1 && (int)(rng() % (++n_ties)) == 0) {
+                            best_i = i; best_j = j;
+                        }
+                    }
+                }
+            }
+            if (best_i == -1) break;
+            // Apply swap (best_i: +1 -> -1, best_j: -1 -> +1)
+            seq[s][best_i] = -1;
+            seq[s][best_j] = 1;
+            // Flip best_i (factor = -2)
+            {
+                const int* gi = &gs[(size_t)best_i * Kpad];
+                for (int k = 0; k < Kpad; ++k) Ps[k] -= 2 * gi[k];
+                const int* mbase = &prob->MT[((size_t)best_i * r) * Kpad];
+                for (int u = 0; u < r; ++u) {
+                    if (u == best_i) continue;
+                    int* gu = &gs[(size_t)u * Kpad];
+                    const int* miu = &mbase[(size_t)u * Kpad];
+                    for (int k = 0; k < Kpad; ++k) gu[k] -= 2 * miu[k];
+                }
+            }
+            // Flip best_j (factor = +2)
+            {
+                const int* gj = &gs[(size_t)best_j * Kpad];
+                for (int k = 0; k < Kpad; ++k) Ps[k] += 2 * gj[k];
+                const int* mbase = &prob->MT[((size_t)best_j * r) * Kpad];
+                for (int u = 0; u < r; ++u) {
+                    if (u == best_j) continue;
+                    int* gu = &gs[(size_t)u * Kpad];
+                    const int* mju = &mbase[(size_t)u * Kpad];
+                    for (int k = 0; k < Kpad; ++k) gu[k] += 2 * mju[k];
+                }
+            }
+        }
+    }
+
+    void resample_single_seq(int s, std::mt19937_64& rng) {
+        if (prob->full_dp.built) {
+            prob->full_dp.sample(prob->target_s[s], seq[s], rng);
+        } else {
+            for (int i = 0; i < r; ++i) seq[s][i] = (rng() & 1) ? 1 : -1;
+        }
+        if (prob->flat_init) flat_seed_single(s, rng, 80);
+    }
+
     void randomize_manifold(std::mt19937_64& rng) {
         if (prob->pure_parity_orbits && !prob->valid_alt_tuples.empty()) {
             const AltTuple& tup = prob->valid_alt_tuples[rng() % prob->valid_alt_tuples.size()];
@@ -624,6 +788,9 @@ struct SearchState {
                 }
             }
             if (ok) {
+                if (prob->flat_init) {
+                    for (int s = 0; s < 4; ++s) flat_seed_single(s, rng, 100);
+                }
                 recompute();
                 return;
             }
@@ -637,11 +804,111 @@ struct SearchState {
                 }
             }
             if (ok) {
+                if (prob->flat_init) {
+                    for (int s = 0; s < 4; ++s) flat_seed_single(s, rng, 120);
+                }
                 recompute();
                 return;
             }
         }
         randomize_uniform(rng);
+    }
+
+    // Fast AVX2 swap assuming seq[s][i_pos] == +1 and seq[s][j_neg] == -1 (m_i = -2 constant!)
+    inline void eval_swap_pos_neg(int s, int i, int j, int64_t& d_ac, int64_t& d_gls, int64_t& d_alt) const {
+        const int* __restrict__ gi = &grad[((size_t)s * r + i) * Kpad];
+        const int* __restrict__ gj = &grad[((size_t)s * r + j) * Kpad];
+        const int* __restrict__ mij = &prob->MT[((size_t)i * r + j) * Kpad];
+        const int* __restrict__ pptr = P.data();
+
+        int64_t dt_ac = 0;
+        int64_t dg_ac = 0;
+
+#ifdef __AVX2__
+        __m256i acc_t = _mm256_setzero_si256();
+        if (!gls_active) {
+            for (int k = 0; k < Kpad; k += 8) {
+                __m256i vgi = _mm256_loadu_si256((const __m256i*)(gi + k));
+                __m256i vgj = _mm256_loadu_si256((const __m256i*)(gj + k));
+                __m256i vmij = _mm256_loadu_si256((const __m256i*)(mij + k));
+                __m256i vp = _mm256_loadu_si256((const __m256i*)(pptr + k));
+                __m256i vdp = _mm256_sub_epi32(_mm256_slli_epi32(_mm256_sub_epi32(vgj, vgi), 1),
+                                               _mm256_slli_epi32(vmij, 2));
+                __m256i vsum = _mm256_add_epi32(_mm256_slli_epi32(vp, 1), vdp);
+                __m256i ev = _mm256_mul_epi32(vdp, vsum);
+                __m256i od = _mm256_mul_epi32(_mm256_srli_epi64(vdp, 32), _mm256_srli_epi64(vsum, 32));
+                acc_t = _mm256_add_epi64(acc_t, _mm256_add_epi64(ev, od));
+            }
+            dt_ac = hsum_epi64(acc_t);
+            dg_ac = dt_ac;
+        } else {
+            const int* __restrict__ wptr = shift_w.data();
+            __m256i acc_g = _mm256_setzero_si256();
+            for (int k = 0; k < Kpad; k += 8) {
+                __m256i vgi = _mm256_loadu_si256((const __m256i*)(gi + k));
+                __m256i vgj = _mm256_loadu_si256((const __m256i*)(gj + k));
+                __m256i vmij = _mm256_loadu_si256((const __m256i*)(mij + k));
+                __m256i vp = _mm256_loadu_si256((const __m256i*)(pptr + k));
+                __m256i vw = _mm256_loadu_si256((const __m256i*)(wptr + k));
+                __m256i vdp = _mm256_sub_epi32(_mm256_slli_epi32(_mm256_sub_epi32(vgj, vgi), 1),
+                                               _mm256_slli_epi32(vmij, 2));
+                __m256i vsum = _mm256_add_epi32(_mm256_slli_epi32(vp, 1), vdp);
+                __m256i vsum_od = _mm256_srli_epi64(vsum, 32);
+
+                __m256i ev_t = _mm256_mul_epi32(vdp, vsum);
+                __m256i od_t = _mm256_mul_epi32(_mm256_srli_epi64(vdp, 32), vsum_od);
+                acc_t = _mm256_add_epi64(acc_t, _mm256_add_epi64(ev_t, od_t));
+
+                __m256i vwdp = _mm256_mullo_epi32(vw, vdp);
+                __m256i ev_g = _mm256_mul_epi32(vwdp, vsum);
+                __m256i od_g = _mm256_mul_epi32(_mm256_srli_epi64(vwdp, 32), vsum_od);
+                acc_g = _mm256_add_epi64(acc_g, _mm256_add_epi64(ev_g, od_g));
+            }
+            dt_ac = hsum_epi64(acc_t);
+            dg_ac = hsum_epi64(acc_g);
+        }
+#else
+        if (!gls_active) {
+            for (int k = 0; k < Kpad; ++k) {
+                int64_t dp = 2LL * (gj[k] - gi[k]) - 4LL * mij[k];
+                dt_ac += dp * (2LL * pptr[k] + dp);
+            }
+            dg_ac = dt_ac;
+        } else {
+            const int* __restrict__ wptr = shift_w.data();
+            for (int k = 0; k < Kpad; ++k) {
+                int64_t dp = 2LL * (gj[k] - gi[k]) - 4LL * mij[k];
+                int64_t term = dp * (2LL * pptr[k] + dp);
+                dt_ac += term;
+                dg_ac += (int64_t)wptr[k] * term;
+            }
+        }
+#endif
+
+        d_ac = dt_ac;
+        d_gls = dg_ac;
+
+        if (prob->w_alt != 0) {
+            int oa_i = prob->orb_alt[i];
+            int oa_j = prob->orb_alt[j];
+            if (oa_i == oa_j) {
+                d_alt = 0;
+            } else {
+                int64_t al_old = alt[s];
+                int64_t al_new = al_old - 2LL * oa_i + 2LL * oa_j;
+                if (prob->use_target_alt) {
+                    int64_t ta = std::abs(prob->target_alt[s]);
+                    int64_t d_old = std::abs(al_old) - ta;
+                    int64_t d_new = std::abs(al_new) - ta;
+                    d_alt = prob->w_alt * (d_new * d_new - d_old * d_old);
+                } else {
+                    int64_t S_new = S_alt + (al_new * al_new - al_old * al_old);
+                    d_alt = calc_E_alt_from_S(S_new) - E_alt;
+                }
+            }
+        } else {
+            d_alt = 0;
+        }
     }
 
     // Evaluate delta of single flip (s, i): returns {d_ac, d_row_raw, d_gls, d_alt}
@@ -1018,6 +1285,9 @@ void record_if_best(int tid, const char* tag, const OrbitProblem& prob, const Se
             if (st.E_ac < g_best_rsum0_E.load(std::memory_order_relaxed)) {
                 g_best_rsum0_E.store(st.E_ac, std::memory_order_relaxed);
                 g_best_rsum0_P.assign(st.P.begin(), st.P.begin() + prob.K);
+                if (!g_save_best_path.empty()) {
+                    save_witness(g_save_best_path, prob, st.seq, st.E_ac);
+                }
                 double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 std::cout << "[t=" << (int)el << "s, T" << tid << " " << tag << "] new best rsum0 E_ac=" << st.E_ac
                           << " (E_alt=" << st.E_alt << ", S_alt=" << st.S_alt << "/" << prob.n << ")" << std::endl;
@@ -1046,7 +1316,7 @@ void record_if_best(int tid, const char* tag, const OrbitProblem& prob, const Se
     if (st.E_true == 0) {
         if (exact_verify_sequences(prob, st.seq)) {
             if (!g_found.exchange(true)) {
-                save_witness(out_path, prob, st.seq);
+                save_witness(out_path, prob, st.seq, 0);
                 std::lock_guard<std::mutex> lk(g_io_mtx);
                 std::cout << "FOUND EXACT VERIFIED SOLUTION! Saved to " << out_path << std::endl;
             }
@@ -1054,21 +1324,138 @@ void record_if_best(int tid, const char* tag, const OrbitProblem& prob, const Se
     }
 }
 
-// Fast Tabu polish with optional GLS and optional strict row-sum lock
+struct SwapCand {
+    int64_t d;
+    int s, i, j;
+};
+
+// Focused 2-Swap Lookahead (2-opt polish) at low-energy rsum0 local minima
+bool polish_2opt(int tid, SearchState& st, const std::chrono::steady_clock::time_point& t0,
+                 double max_seconds, const std::string& out_path, int max_cands = 64) {
+    const OrbitProblem& prob = *st.prob;
+    if (st.E_row != 0 || prob.size_groups.empty()) return false;
+    bool gls_was = st.gls_active;
+    st.gls_active = false;
+    bool any_improved = false;
+
+    std::vector<int> pos_buf, neg_buf;
+    pos_buf.reserve(prob.r);
+    neg_buf.reserve(prob.r);
+    std::vector<SwapCand> cands;
+    cands.reserve(4096);
+
+    while (!g_found.load(std::memory_order_relaxed)) {
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el >= max_seconds) break;
+
+        // Pass 1: collect all 1-swaps; if any strictly improves E_ac, take best 1-swap immediately
+        cands.clear();
+        int64_t best_d1 = 0;
+        int bs = -1, bi = -1, bj = -1;
+        for (int s = 0; s < 4; ++s) {
+            for (const auto& grp : prob.size_groups) {
+                pos_buf.clear();
+                neg_buf.clear();
+                for (int idx : grp) {
+                    if (st.seq[s][idx] > 0) pos_buf.push_back(idx);
+                    else neg_buf.push_back(idx);
+                }
+                for (int i : pos_buf) {
+                    for (int j : neg_buf) {
+                        int64_t dac, dg, da;
+                        st.eval_swap_pos_neg(s, i, j, dac, dg, da);
+                        if (dac < best_d1) {
+                            best_d1 = dac; bs = s; bi = i; bj = j;
+                        }
+                        cands.push_back({dac, s, i, j});
+                    }
+                }
+            }
+        }
+        if (bs != -1) {
+            st.apply_swap(bs, bi, bj, best_d1, best_d1, 0);
+            any_improved = true;
+            record_if_best(tid, "2opt-1", prob, st, t0, out_path);
+            if (g_found.load(std::memory_order_relaxed)) break;
+            continue;
+        }
+
+        // At a 1-swap local minimum: take top max_cands first swaps and lookahead for best 2nd swap
+        int M = std::min((int)cands.size(), max_cands);
+        std::nth_element(cands.begin(), cands.begin() + M, cands.end(),
+                         [](const SwapCand& a, const SwapCand& b) { return a.d < b.d; });
+        std::sort(cands.begin(), cands.begin() + M,
+                  [](const SwapCand& a, const SwapCand& b) { return a.d < b.d; });
+
+        bool found_2swap = false;
+        for (int c = 0; c < M; ++c) {
+            const auto& c1 = cands[c];
+            // Tentatively apply swap c1 (exact involution!)
+            st.apply_swap(c1.s, c1.i, c1.j, c1.d, c1.d, 0);
+
+            int64_t best_d2 = -c1.d; // need d1 + d2 < 0 => d2 < -d1
+            int b2s = -1, b2i = -1, b2j = -1;
+            for (int s = 0; s < 4; ++s) {
+                for (const auto& grp : prob.size_groups) {
+                    pos_buf.clear();
+                    neg_buf.clear();
+                    for (int idx : grp) {
+                        if (st.seq[s][idx] > 0) pos_buf.push_back(idx);
+                        else neg_buf.push_back(idx);
+                    }
+                    for (int i : pos_buf) {
+                        for (int j : neg_buf) {
+                            int64_t dac, dg, da;
+                            st.eval_swap_pos_neg(s, i, j, dac, dg, da);
+                            if (dac < best_d2) {
+                                best_d2 = dac; b2s = s; b2i = i; b2j = j;
+                            }
+                        }
+                    }
+                }
+            }
+            if (b2s != -1) {
+                st.apply_swap(b2s, b2i, b2j, best_d2, best_d2, 0);
+                g_two_opt_hits.fetch_add(1, std::memory_order_relaxed);
+                any_improved = true;
+                found_2swap = true;
+                record_if_best(tid, "2opt", prob, st, t0, out_path);
+                break;
+            } else {
+                // Exact undo of c1
+                st.apply_swap(c1.s, c1.i, c1.j, -c1.d, -c1.d, 0);
+            }
+        }
+        if (!found_2swap) break;
+    }
+
+    st.gls_active = gls_was;
+    st.recompute_E_gls();
+    return any_improved;
+}
+
+// Fast Tabu polish with optional GLS, strict row-sum lock, branchless pos/neg swaps, and 1-seq LNS
 bool tabu_polish(int tid, const char* tag, SearchState& st, int max_steps, int max_no_imp,
                  bool use_gls, bool lock_row, std::mt19937_64& rng,
                  const std::chrono::steady_clock::time_point& t0,
-                 double max_seconds, const std::string& out_path) {
+                 double max_seconds, const std::string& out_path, int only_s = -1) {
     const OrbitProblem& prob = *st.prob;
     int r = prob.r;
     std::vector<uint64_t> tabu((size_t)4 * r, 0);
-    int tabu_tenure = 5 + (int)(rng() % 10);
+    int base_tenure = std::max(6, r / 4);
+    int tabu_tenure = base_tenure + (int)(rng() % (base_tenure + 1));
+    int s_lo = (only_s >= 0) ? only_s : 0;
+    int s_hi = (only_s >= 0) ? (only_s + 1) : 4;
 
     int64_t start_E_true = st.E_true;
     int64_t best_E_search = st.E_search;
     int64_t best_E_true = st.E_true;
     std::vector<int> best_seq[4];
     for (int s = 0; s < 4; ++s) best_seq[s] = st.seq[s];
+
+    std::vector<int> pos_buf, neg_buf;
+    pos_buf.reserve(r);
+    neg_buf.reserve(r);
 
     int no_imp_search = 0;
     int no_imp_true = 0;
@@ -1090,7 +1477,7 @@ bool tabu_polish(int tid, const char* tag, SearchState& st, int max_steps, int m
 
         // 0. Single flips (only when not strictly locked on E_row == 0)
         if (!lock_row || st.E_row != 0) {
-            for (int s = 0; s < 4; ++s) {
+            for (int s = s_lo; s < s_hi; ++s) {
                 for (int i = 0; i < r; ++i) {
                     int64_t dac, drow, dg, da;
                     st.eval_flip(s, i, dac, drow, dg, da);
@@ -1114,25 +1501,35 @@ bool tabu_polish(int tid, const char* tag, SearchState& st, int max_steps, int m
             }
         }
 
-        // 1. Same-size swaps (exact row-sum preserving)
-        for (int s = 0; s < 4; ++s) {
-            for (const auto& pr : prob.same_size_pairs) {
-                int i = pr.first, j = pr.second;
-                if (st.seq[s][i] == st.seq[s][j]) continue;
-                int64_t dac, dg, da;
-                st.eval_swap(s, i, j, dac, dg, da);
-                int64_t ds = dg + da;
-                bool is_tabu = (tabu[s * r + i] > (uint64_t)step || tabu[s * r + j] > (uint64_t)step) &&
-                               (st.E_search + ds >= best_E_search) &&
-                               (st.E_true + dac >= best_E_true);
-                if (!is_tabu) {
-                    if (ds < best_d_search) {
-                        best_d_search = ds; best_d_ac = dac; best_d_row = 0; best_d_gls = dg; best_d_alt = da;
-                        best_type = 1; best_s = s; best_i = i; best_j = j; n_ties = 1;
-                    } else if (ds == best_d_search) {
-                        if ((int)(rng() % (++n_ties)) == 0) {
-                            best_d_ac = dac; best_d_row = 0; best_d_gls = dg; best_d_alt = da;
-                            best_type = 1; best_s = s; best_i = i; best_j = j;
+        // 1. Same-size swaps via branchless pos x neg split lists (exact row-sum preserving)
+        for (int s = s_lo; s < s_hi; ++s) {
+            const uint64_t* t_s = &tabu[(size_t)s * r];
+            for (const auto& grp : prob.size_groups) {
+                pos_buf.clear();
+                neg_buf.clear();
+                for (int idx : grp) {
+                    if (st.seq[s][idx] > 0) pos_buf.push_back(idx);
+                    else neg_buf.push_back(idx);
+                }
+                for (int i : pos_buf) {
+                    bool ti = (t_s[i] > (uint64_t)step);
+                    for (int j : neg_buf) {
+                        int64_t dac, dg, da;
+                        st.eval_swap_pos_neg(s, i, j, dac, dg, da);
+                        int64_t ds = dg + da;
+                        bool is_tabu = (ti || t_s[j] > (uint64_t)step) &&
+                                       (st.E_search + ds >= best_E_search) &&
+                                       (st.E_true + dac >= best_E_true);
+                        if (!is_tabu) {
+                            if (ds < best_d_search) {
+                                best_d_search = ds; best_d_ac = dac; best_d_row = 0; best_d_gls = dg; best_d_alt = da;
+                                best_type = 1; best_s = s; best_i = i; best_j = j; n_ties = 1;
+                            } else if (ds == best_d_search) {
+                                if ((int)(rng() % (++n_ties)) == 0) {
+                                    best_d_ac = dac; best_d_row = 0; best_d_gls = dg; best_d_alt = da;
+                                    best_type = 1; best_s = s; best_i = i; best_j = j;
+                                }
+                            }
                         }
                     }
                 }
@@ -1140,27 +1537,29 @@ bool tabu_polish(int tid, const char* tag, SearchState& st, int max_steps, int m
         }
 
         // 2. Row-sum-preserving 3-orbit triples: size[i] == size[j] + size[k]
-        for (int s = 0; s < 4; ++s) {
-            for (const auto& tr : prob.row_preserving_triples) {
-                int i = tr.i, j = tr.j, k_orb = tr.k;
-                int sj = st.seq[s][j];
-                if (sj != st.seq[s][k_orb] || st.seq[s][i] == sj) continue;
-                int64_t dac, dg, da;
-                st.eval_triple(s, i, j, k_orb, dac, dg, da);
-                int64_t ds = dg + da;
-                bool is_tabu = (tabu[s * r + i] > (uint64_t)step ||
-                                tabu[s * r + j] > (uint64_t)step ||
-                                tabu[s * r + k_orb] > (uint64_t)step) &&
-                               (st.E_search + ds >= best_E_search) &&
-                               (st.E_true + dac >= best_E_true);
-                if (!is_tabu) {
-                    if (ds < best_d_search) {
-                        best_d_search = ds; best_d_ac = dac; best_d_row = 0; best_d_gls = dg; best_d_alt = da;
-                        best_type = 2; best_s = s; best_i = i; best_j = j; best_k = k_orb; n_ties = 1;
-                    } else if (ds == best_d_search) {
-                        if ((int)(rng() % (++n_ties)) == 0) {
-                            best_d_ac = dac; best_d_row = 0; best_d_gls = dg; best_d_alt = da;
-                            best_type = 2; best_s = s; best_i = i; best_j = j; best_k = k_orb;
+        if (!prob.row_preserving_triples.empty()) {
+            for (int s = s_lo; s < s_hi; ++s) {
+                for (const auto& tr : prob.row_preserving_triples) {
+                    int i = tr.i, j = tr.j, k_orb = tr.k;
+                    int sj = st.seq[s][j];
+                    if (sj != st.seq[s][k_orb] || st.seq[s][i] == sj) continue;
+                    int64_t dac, dg, da;
+                    st.eval_triple(s, i, j, k_orb, dac, dg, da);
+                    int64_t ds = dg + da;
+                    bool is_tabu = (tabu[s * r + i] > (uint64_t)step ||
+                                    tabu[s * r + j] > (uint64_t)step ||
+                                    tabu[s * r + k_orb] > (uint64_t)step) &&
+                                   (st.E_search + ds >= best_E_search) &&
+                                   (st.E_true + dac >= best_E_true);
+                    if (!is_tabu) {
+                        if (ds < best_d_search) {
+                            best_d_search = ds; best_d_ac = dac; best_d_row = 0; best_d_gls = dg; best_d_alt = da;
+                            best_type = 2; best_s = s; best_i = i; best_j = j; best_k = k_orb; n_ties = 1;
+                        } else if (ds == best_d_search) {
+                            if ((int)(rng() % (++n_ties)) == 0) {
+                                best_d_ac = dac; best_d_row = 0; best_d_gls = dg; best_d_alt = da;
+                                best_type = 2; best_s = s; best_i = i; best_j = j; best_k = k_orb;
+                            }
                         }
                     }
                 }
@@ -1324,7 +1723,7 @@ void worker_pt(int tid, const OrbitProblem& prob, double max_seconds,
                 } else if (n_pairs > 0) {
                     int s = (int)(rng() & 3);
                     std::pair<int, int> pr;
-                    if (n_same_alt_pairs > 0 && (rng() & 1)) {
+                    if (prob.use_alt && n_same_alt_pairs > 0 && (rng() & 1)) {
                         pr = prob.same_size_same_alt_pairs[rng() % n_same_alt_pairs];
                     } else {
                         pr = prob.same_size_pairs[rng() % n_pairs];
@@ -1369,7 +1768,7 @@ void worker_pt(int tid, const OrbitProblem& prob, double max_seconds,
     }
 }
 
-// Worker B: Manifold-Initialized Tabu + Guided Local Search (GLS) + ILS
+// Worker B: Manifold-Initialized Tabu + Guided Local Search (GLS) + ILS + 1-Seq LNS
 void worker_gls_ils(int tid, const OrbitProblem& prob, double max_seconds,
                     bool use_gls, const std::string& out_path, uint64_t seed) {
     std::mt19937_64 rng(seed);
@@ -1403,6 +1802,16 @@ void worker_gls_ils(int tid, const OrbitProblem& prob, double max_seconds,
                         rng, t0, max_seconds, out_path);
             if (g_found.load(std::memory_order_relaxed)) return;
 
+            // Focused 2-Swap Lookahead (2-opt) at low-energy rsum0 local minima
+            if (st.E_row == 0 && st.E_ac <= g_two_opt_thresh) {
+                polish_2opt(tid, st, t0, max_seconds, out_path, 64);
+                if (g_found.load(std::memory_order_relaxed)) return;
+            }
+
+            if (st.E_row == 0) {
+                elite_try_insert(st.E_ac, st.seq);
+            }
+
             if (st.E_true < best_E_true) {
                 best_E_true = st.E_true;
                 for (int s = 0; s < 4; ++s) best_seq[s] = st.seq[s];
@@ -1411,63 +1820,103 @@ void worker_gls_ils(int tid, const OrbitProblem& prob, double max_seconds,
                 ++kicks_without_improve;
             }
 
-            // Structure-preserving ILS kick from best_seq
+            // Alternate between Elite Crossover (20%), 1-Sequence LNS (35%), and small kicks (45%)
             for (int s = 0; s < 4; ++s) st.seq[s] = best_seq[s];
-            int n_kicks = 2 + (int)(rng() % 5);
-            for (int kc = 0; kc < n_kicks; ++kc) {
-                int s = (int)(rng() & 3);
-                if (prob.lock_row) {
-                    // Strictly row-sum preserving kick (valid swap or valid triple)
-                    bool done = false;
-                    for (int tries = 0; tries < 20 && !done; ++tries) {
-                        if (!prob.row_preserving_triples.empty() && (rng() % 3) == 0) {
+            int kick_roll = (int)(rng() % 100);
+            bool did_crossover = false;
+            if (kick_roll < 20) {
+                std::vector<int> eA[4], eB[4];
+                {
+                    std::lock_guard<std::mutex> lk(g_elite_mtx);
+                    if (g_elite.size() >= 2) {
+                        size_t iA = rng() % g_elite.size();
+                        size_t iB = (iA + 1 + (rng() % (g_elite.size() - 1))) % g_elite.size();
+                        for (int s = 0; s < 4; ++s) {
+                            eA[s] = g_elite[iA].seq[s];
+                            eB[s] = g_elite[iB].seq[s];
+                        }
+                        did_crossover = true;
+                    }
+                }
+                if (did_crossover) {
+                    // Take 2 or 3 sequences from elite A and remaining from elite B (preserving target_s!)
+                    int mask = 1 + (int)(rng() % 14); // non-trivial subset of {0,1,2,3}
+                    for (int s = 0; s < 4; ++s) {
+                        st.seq[s] = ((mask >> s) & 1) ? eA[s] : eB[s];
+                    }
+                    st.reset_gls_weights();
+                    st.recompute();
+                    int s_pol = (int)(rng() & 3);
+                    tabu_polish(tid, "Xover-1s", st, 800, 200, false, prob.lock_row,
+                                rng, t0, max_seconds, out_path, s_pol);
+                    if (g_found.load(std::memory_order_relaxed)) return;
+                }
+            }
+            if (!did_crossover && kick_roll < 55) {
+                // 1-Sequence Large Neighborhood Search: resample 1 sequence & polish it against fixed 3
+                int s_lns = (int)(rng() & 3);
+                st.resample_single_seq(s_lns, rng);
+                st.reset_gls_weights();
+                st.recompute();
+                tabu_polish(tid, "LNS-1s", st, 1200, 300, false, prob.lock_row,
+                            rng, t0, max_seconds, out_path, s_lns);
+                if (g_found.load(std::memory_order_relaxed)) return;
+            } else if (!did_crossover) {
+                int n_kicks = 3 + (int)(rng() % 6);
+                for (int kc = 0; kc < n_kicks; ++kc) {
+                    int s = (int)(rng() & 3);
+                    if (prob.lock_row) {
+                        bool done = false;
+                        for (int tries = 0; tries < 20 && !done; ++tries) {
+                            if (!prob.row_preserving_triples.empty() && (rng() % 3) == 0) {
+                                const auto& tr = prob.row_preserving_triples[rng() % prob.row_preserving_triples.size()];
+                                int sj = st.seq[s][tr.j];
+                                if (sj == st.seq[s][tr.k] && st.seq[s][tr.i] != sj) {
+                                    st.seq[s][tr.i] = -st.seq[s][tr.i];
+                                    st.seq[s][tr.j] = -st.seq[s][tr.j];
+                                    st.seq[s][tr.k] = -st.seq[s][tr.k];
+                                    done = true;
+                                }
+                            } else if (!prob.same_size_pairs.empty()) {
+                                const auto& pr = prob.same_size_pairs[rng() % prob.same_size_pairs.size()];
+                                if (st.seq[s][pr.first] != st.seq[s][pr.second]) {
+                                    st.seq[s][pr.first] = -st.seq[s][pr.first];
+                                    st.seq[s][pr.second] = -st.seq[s][pr.second];
+                                    done = true;
+                                }
+                            }
+                        }
+                    } else {
+                        int mode = (int)(rng() % 6);
+                        if (mode < 2 && prob.use_alt && !prob.same_size_same_alt_pairs.empty()) {
+                            const auto& pr = prob.same_size_same_alt_pairs[rng() % prob.same_size_same_alt_pairs.size()];
+                            if (st.seq[s][pr.first] != st.seq[s][pr.second]) {
+                                st.seq[s][pr.first] = -st.seq[s][pr.first];
+                                st.seq[s][pr.second] = -st.seq[s][pr.second];
+                            }
+                        } else if (mode < 4 && !prob.same_size_pairs.empty()) {
+                            const auto& pr = prob.same_size_pairs[rng() % prob.same_size_pairs.size()];
+                            if (st.seq[s][pr.first] != st.seq[s][pr.second]) {
+                                st.seq[s][pr.first] = -st.seq[s][pr.first];
+                                st.seq[s][pr.second] = -st.seq[s][pr.second];
+                            }
+                        } else if (mode == 4 && !prob.row_preserving_triples.empty()) {
                             const auto& tr = prob.row_preserving_triples[rng() % prob.row_preserving_triples.size()];
                             int sj = st.seq[s][tr.j];
                             if (sj == st.seq[s][tr.k] && st.seq[s][tr.i] != sj) {
                                 st.seq[s][tr.i] = -st.seq[s][tr.i];
                                 st.seq[s][tr.j] = -st.seq[s][tr.j];
                                 st.seq[s][tr.k] = -st.seq[s][tr.k];
-                                done = true;
                             }
-                        } else if (!prob.same_size_pairs.empty()) {
-                            const auto& pr = prob.same_size_pairs[rng() % prob.same_size_pairs.size()];
-                            if (st.seq[s][pr.first] != st.seq[s][pr.second]) {
-                                st.seq[s][pr.first] = -st.seq[s][pr.first];
-                                st.seq[s][pr.second] = -st.seq[s][pr.second];
-                                done = true;
-                            }
+                        } else {
+                            int i = (int)(rng() % prob.r);
+                            st.seq[s][i] = -st.seq[s][i];
                         }
-                    }
-                } else {
-                    int mode = (int)(rng() % 6);
-                    if (mode < 2 && !prob.same_size_same_alt_pairs.empty()) {
-                        const auto& pr = prob.same_size_same_alt_pairs[rng() % prob.same_size_same_alt_pairs.size()];
-                        if (st.seq[s][pr.first] != st.seq[s][pr.second]) {
-                            st.seq[s][pr.first] = -st.seq[s][pr.first];
-                            st.seq[s][pr.second] = -st.seq[s][pr.second];
-                        }
-                    } else if (mode < 4 && !prob.same_size_pairs.empty()) {
-                        const auto& pr = prob.same_size_pairs[rng() % prob.same_size_pairs.size()];
-                        if (st.seq[s][pr.first] != st.seq[s][pr.second]) {
-                            st.seq[s][pr.first] = -st.seq[s][pr.first];
-                            st.seq[s][pr.second] = -st.seq[s][pr.second];
-                        }
-                    } else if (mode == 4 && !prob.row_preserving_triples.empty()) {
-                        const auto& tr = prob.row_preserving_triples[rng() % prob.row_preserving_triples.size()];
-                        int sj = st.seq[s][tr.j];
-                        if (sj == st.seq[s][tr.k] && st.seq[s][tr.i] != sj) {
-                            st.seq[s][tr.i] = -st.seq[s][tr.i];
-                            st.seq[s][tr.j] = -st.seq[s][tr.j];
-                            st.seq[s][tr.k] = -st.seq[s][tr.k];
-                        }
-                    } else {
-                        int i = (int)(rng() % prob.r);
-                        st.seq[s][i] = -st.seq[s][i];
                     }
                 }
+                st.reset_gls_weights();
+                st.recompute();
             }
-            st.reset_gls_weights();
-            st.recompute();
         }
     }
 }
@@ -1488,8 +1937,9 @@ int main(int argc, char** argv) {
     if (argc < 6) {
         std::cerr << "Usage: " << argv[0]
                   << " <m> <g|g1,g2,...> <b> <seconds> <out.json> [threads=2] [s0 s1 s2 s3]"
-                  << " [--gens=g1,g2,...] [--w_row=64] [--w_alt=16] [--lock_row=0|1]"
-                  << " [--target_alt=a0,a1,a2,a3] [--mode=hybrid|ils|pt] [--gls=1|0]\n";
+                  << " [--gens=g1,g2,...] [--ts=s0,s1,s2,s3] [--w_row=64] [--w_alt=16]"
+                  << " [--lock_row=0|1] [--flat_init=0|1] [--target_alt=a0,a1,a2,a3]"
+                  << " [--mode=hybrid|ils|pt] [--gls=1|0] [--save_best=<path>] [--two_opt_thresh=2000]\n";
         return 1;
     }
     int m = std::stoi(argv[1]);
@@ -1504,6 +1954,7 @@ int main(int argc, char** argv) {
     int64_t w_row = 64;
     int64_t w_alt = 16;
     bool lock_row = false;
+    bool flat_init = false;
     std::string mode = "hybrid";
     bool use_gls = true;
 
@@ -1516,6 +1967,17 @@ int main(int argc, char** argv) {
             w_alt = std::stoll(a.substr(8));
         } else if (a.rfind("--lock_row=", 0) == 0) {
             lock_row = (std::stoi(a.substr(11)) != 0);
+        } else if (a.rfind("--flat_init=", 0) == 0) {
+            flat_init = (std::stoi(a.substr(12)) != 0);
+        } else if (a.rfind("--save_best=", 0) == 0) {
+            g_save_best_path = a.substr(12);
+        } else if (a.rfind("--two_opt_thresh=", 0) == 0) {
+            g_two_opt_thresh = std::stoll(a.substr(17));
+        } else if (a.rfind("--ts=", 0) == 0) {
+            auto vals = parse_int_list(a.substr(5));
+            if (vals.size() == 4) {
+                for (int k = 0; k < 4; ++k) ts[k] = vals[k];
+            }
         } else if (a.rfind("--gens=", 0) == 0) {
             gens = parse_int_list(a.substr(7));
         } else if (a == "--gens" && i + 1 < argc) {
@@ -1541,7 +2003,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 4; ++i) ts[i] = std::stoi(pos[1 + i]);
     }
 
-    OrbitProblem prob = build_problem(m, gens, b, ts, w_row, w_alt, lock_row, use_talt, talt);
+    OrbitProblem prob = build_problem(m, gens, b, ts, w_row, w_alt, lock_row, flat_init, use_talt, talt);
     std::cout << "Hadamard v3 n=" << prob.n << " (m=" << m << ", |U|=" << prob.U.size()
               << ", gens=[";
     for (size_t i = 0; i < prob.gens.size(); ++i) {
@@ -1556,6 +2018,8 @@ int main(int argc, char** argv) {
               << ", valid_2comp=" << prob.valid_alt_tuples.size()
               << ", w_row=" << prob.w_row << ", w_alt=" << prob.w_alt
               << ", lock_row=" << (prob.lock_row ? 1 : 0)
+              << ", flat_init=" << (prob.flat_init ? 1 : 0)
+              << ", 2opt_th=" << g_two_opt_thresh
               << ", mode=" << mode << ", gls=" << (use_gls ? 1 : 0);
 #ifdef __AVX2__
     std::cout << ", simd=AVX2";
@@ -1584,6 +2048,7 @@ int main(int argc, char** argv) {
 
     std::cout << "Summary: tabu_steps=" << g_tabu_steps.load()
               << ", pt_steps=" << g_pt_steps.load()
+              << ", two_opt_hits=" << g_two_opt_hits.load()
               << ", best_E=" << g_best_true_E.load()
               << ", best_rsum0_E=" << (g_best_rsum0_E.load() == INT64_MAX ? -1 : g_best_rsum0_E.load())
               << ", best_manifold_E=" << (g_best_manifold_E.load() == INT64_MAX ? -1 : g_best_manifold_E.load())
