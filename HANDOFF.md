@@ -52,3 +52,62 @@ Find a previously unknown Hadamard matrix of open order $n \le 10{,}000$ (live l
 ### Next steps
 - Tune solver on n=1948 until E=0, then retry n=4412; run tmatrix_solver on t=163/151 then t=463.
 - Any E=0 must be checked with verify.py / verify_tmatrix.py before any claim; then Lean witness.
+
+## Session 3 results
+
+The bounded searches produced no witness for a previously unknown order. On
+24 November 2026, the 85 orders in `UNKNOWN_85` matched Math74's list through
+order 10,000.
+
+- **Theorem 5.** `python3 verify_historical_exclusions.py` independently
+  reproduces the exclusions of `7572 g=15`, `6668 g=9`, and `7572 g=9`.
+  `python3 -u decompress_r54.py 9388 7180 6236` gives the following exact
+  results for the specified cyclic multiplier groups.
+
+  | Order | Generator | Compression | Lifts |
+  |---:|---:|---:|---:|
+  | 9388 | 25 | 391 → 782 | 0 of 320 |
+  | 7180 | 49 | 299 → 598 | 0 of 2188 |
+  | 6236 | 119 | 19 → 38 | 3 of 136 |
+
+  The zero counts exclude the respective multiplier families. The surviving
+  6236 family has a directly verified modulus-38 witness, exportable with
+  `python3 decompress_r54.py 6236 --witness-out /tmp/compressed-6236.json`.
+  The modulus-41 enumeration exceeded the exploratory memory budget.
+- **Theorem 7.** The split symmetry cycling the three nonzero
+  `Z_2^2` coordinates and fixing `S` pointwise forces order 28. The proof is
+  in `scan_thm7.py`. The scan finds zero eligible open orders after applying
+  this restriction. `python3 verify_thm7.py` verifies the known order-28
+  example. The MITM solver returns `INCONCLUSIVE` when its pair cap skips a
+  case and the remaining cases yield no solution.
+- **Goethals–Seidel search.** `python3 verify.py fixtures/published_1948.json`
+  checks all autocorrelations and the full integer Gram matrix for the
+  published order-1948 control. The new record-to-record mode found and
+  exactly verified order 52 in 376 proposals. Blind order-1948 trials
+  reached `E=640`, above the previous `E=480`. The two-thread ILS trial at
+  order 4412 reached `E=864` in 120 seconds, above the previous `E=832`.
+  The source of the control and
+  the original search method are in [Alpöge, Voinov and Reynolds-Haertle, §5.1 and Table A1](https://hexagonmath.org/2611.00637v1).
+- **T-matrix search.** The updated hybrid solver rediscovered `t=163`.
+  `verify_tmatrix.py` verified its witness exactly. The `t=151` run reached
+  `E=4` in 45 seconds. At `t=463`, the baseline reached `E=34` in 30 seconds
+  and the revised solver reached `E=36` in 60 seconds.
+- **Lean and witness verification.** `cd lean && lake build` checks the
+  unbordered and even-length bordered constructions and a concrete
+  order-12 witness. `verify.py` expands both single-generator and
+  multi-generator witness files using exact integers.
+
+Build and reproduce the bounded solver trials from the repository root.
+
+```sh
+g++ -std=c++20 -O3 -march=native -pthread solver_v3.cpp -o solver_v3
+g++ -std=c++20 -O3 -march=native -pthread tmatrix_solver.cpp -o tmatrix_solver
+
+./solver_v3 487 362 0 80 /tmp/rrt-1948.json 1 --ts=17,1,17,37 \
+  --mode=rrt --lock_row=1 --flat_init=1 --w_flat=0.8 --seed=1948 --rrt_stage_steps=32000
+./solver_v3 1103 749 0 120 /tmp/ils-4412.json 2 --ts=1,37,39,39 \
+  --mode=ils --lock_row=1 --flat_init=1 --seed=4420
+./tmatrix_solver 163 38 0 1 1 0 30 /tmp/tmatrix-163.json 2 hybrid
+./tmatrix_solver 151 8 0 2 1 1 45 /tmp/tmatrix-151.json 2 hybrid
+./tmatrix_solver 463 15 -1 1 1 1 60 /tmp/tmatrix-463.json 2 hybrid
+```
