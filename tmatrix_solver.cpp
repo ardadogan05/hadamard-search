@@ -22,6 +22,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #ifdef __AVX2__
 #include <immintrin.h>
@@ -410,6 +411,87 @@ struct State {
         return W ? dW : dE;
     }
 
+    // Fused evaluator for Move 1 + all 6 Move 3 variants (b != a, fb in {0, 1}) for pair (i in pos[a], j in neg[a]).
+    // Outputs dW1, dE1 for Move 1, and dW3[b][fb], dE3[b][fb] for b != a.
+    inline void eval_move1_and_3_all(int i, int j, int a, const int* __restrict__ W,
+                                     int64_t& dW1, int64_t& dE1,
+                                     int64_t dW3[4][2], int64_t dE3[4][2]) const {
+        const int* __restrict__ Cai = &C[(a * r + i) * K_pad];
+        const int* __restrict__ Caj = &C[(a * r + j) * K_pad];
+        const int* __restrict__ mij = &inst->MT[(i * r + j) * K_pad];
+        const int* __restrict__ pptr = P.data();
+        int b_list[3];
+        int nb = 0;
+        for (int b = 0; b < 4; ++b) if (b != a) b_list[nb++] = b;
+        const int* __restrict__ Cbi0 = &C[(b_list[0] * r + i) * K_pad];
+        const int* __restrict__ Cbj0 = &C[(b_list[0] * r + j) * K_pad];
+        const int* __restrict__ Cbi1 = &C[(b_list[1] * r + i) * K_pad];
+        const int* __restrict__ Cbj1 = &C[(b_list[1] * r + j) * K_pad];
+        const int* __restrict__ Cbi2 = &C[(b_list[2] * r + i) * K_pad];
+        const int* __restrict__ Cbj2 = &C[(b_list[2] * r + j) * K_pad];
+#ifdef __AVX2__
+        __m256i accE1 = _mm256_setzero_si256(), accW1 = _mm256_setzero_si256();
+        __m256i accE3[3][2], accW3[3][2];
+        for (int u = 0; u < 3; ++u) {
+            accE3[u][0] = accE3[u][1] = _mm256_setzero_si256();
+            accW3[u][0] = accW3[u][1] = _mm256_setzero_si256();
+        }
+        for (int k = 0; k < K_pad; k += 8) {
+            __m256i vcai = _mm256_loadu_si256((const __m256i*)(Cai + k));
+            __m256i vcaj = _mm256_loadu_si256((const __m256i*)(Caj + k));
+            __m256i vmij = _mm256_loadu_si256((const __m256i*)(mij + k));
+            __m256i vp2 = _mm256_slli_epi32(_mm256_loadu_si256((const __m256i*)(pptr + k)), 1);
+            __m256i va = _mm256_sub_epi32(_mm256_sub_epi32(vcaj, vcai), _mm256_slli_epi32(vmij, 1));
+            __m256i vdp1 = _mm256_slli_epi32(va, 1);
+            __m256i vt1 = _mm256_mullo_epi32(vdp1, _mm256_add_epi32(vp2, vdp1));
+            accE1 = _mm256_add_epi32(accE1, vt1);
+
+            __m256i vb0 = _mm256_sub_epi32(_mm256_loadu_si256((const __m256i*)(Cbi0 + k)), _mm256_loadu_si256((const __m256i*)(Cbj0 + k)));
+            __m256i vb1 = _mm256_sub_epi32(_mm256_loadu_si256((const __m256i*)(Cbi1 + k)), _mm256_loadu_si256((const __m256i*)(Cbj1 + k)));
+            __m256i vb2 = _mm256_sub_epi32(_mm256_loadu_si256((const __m256i*)(Cbi2 + k)), _mm256_loadu_si256((const __m256i*)(Cbj2 + k)));
+            __m256i vbs[3] = {vb0, vb1, vb2};
+
+            if (!W) {
+                for (int u = 0; u < 3; ++u) {
+                    __m256i dpp = _mm256_add_epi32(va, vbs[u]);
+                    __m256i dpm = _mm256_sub_epi32(va, vbs[u]);
+                    accE3[u][0] = _mm256_add_epi32(accE3[u][0], _mm256_mullo_epi32(dpp, _mm256_add_epi32(vp2, dpp)));
+                    accE3[u][1] = _mm256_add_epi32(accE3[u][1], _mm256_mullo_epi32(dpm, _mm256_add_epi32(vp2, dpm)));
+                }
+            } else {
+                __m256i vw = _mm256_loadu_si256((const __m256i*)(W + k));
+                accW1 = _mm256_add_epi32(accW1, _mm256_mullo_epi32(vw, vt1));
+                for (int u = 0; u < 3; ++u) {
+                    __m256i dpp = _mm256_add_epi32(va, vbs[u]);
+                    __m256i dpm = _mm256_sub_epi32(va, vbs[u]);
+                    __m256i tp = _mm256_mullo_epi32(dpp, _mm256_add_epi32(vp2, dpp));
+                    __m256i tm = _mm256_mullo_epi32(dpm, _mm256_add_epi32(vp2, dpm));
+                    accE3[u][0] = _mm256_add_epi32(accE3[u][0], tp);
+                    accE3[u][1] = _mm256_add_epi32(accE3[u][1], tm);
+                    accW3[u][0] = _mm256_add_epi32(accW3[u][0], _mm256_mullo_epi32(vw, tp));
+                    accW3[u][1] = _mm256_add_epi32(accW3[u][1], _mm256_mullo_epi32(vw, tm));
+                }
+            }
+        }
+        dE1 = hsum_epi32_to_64(accE1);
+        dW1 = W ? hsum_epi32_to_64(accW1) : dE1;
+        for (int u = 0; u < 3; ++u) {
+            int b = b_list[u];
+            dE3[b][0] = hsum_epi32_to_64(accE3[u][0]);
+            dE3[b][1] = hsum_epi32_to_64(accE3[u][1]);
+            dW3[b][0] = W ? hsum_epi32_to_64(accW3[u][0]) : dE3[b][0];
+            dW3[b][1] = W ? hsum_epi32_to_64(accW3[u][1]) : dE3[b][1];
+        }
+#else
+        eval_move1_both(i, j, a, W, dW1, dE1);
+        for (int u = 0; u < 3; ++u) {
+            int b = b_list[u];
+            eval_move3_both(i, j, a, b, 0, W, dW3[b][0], dE3[b][0]);
+            eval_move3_both(i, j, a, b, 1, W, dW3[b][1], dE3[b][1]);
+        }
+#endif
+    }
+
     void apply_move3(int i, int j, int a, int b, int flip_b) {
         const int* Cai = &C[(a * r + i) * K_pad];
         const int* Caj = &C[(a * r + j) * K_pad];
@@ -693,6 +775,76 @@ static bool polish_2move(State& st, int top_k = 24) {
     return improved_any;
 }
 
+// 2-Matrix LNS: hold the other 2 T-matrices fixed and run fast Tabu on orbits in {ma, mb}.
+static void lns_pair_tabu(State& st, int ma, int mb, int steps, std::mt19937_64& rng) {
+    const Instance* inst = st.inst;
+    std::vector<int> tabu(inst->r * 8, 0);
+    std::vector<int> pos[2], neg[2];
+    int mats[2] = {ma, mb};
+    State best_st = st;
+    int64_t best_E = st.E;
+    int tenure = 3;
+    for (int step = 1; step <= steps && st.E > 0; ++step) {
+        pos[0].clear(); neg[0].clear(); pos[1].clear(); neg[1].clear();
+        for (int i = 1; i < inst->r; ++i) {
+            int m = st.mat[i];
+            if (m == ma) {
+                if (st.sgn[i] == 1) pos[0].push_back(i); else neg[0].push_back(i);
+            } else if (m == mb) {
+                if (st.sgn[i] == 1) pos[1].push_back(i); else neg[1].push_back(i);
+            }
+        }
+        BestMove best;
+        uint64_t ties = 0;
+        auto consider = [&](int type, int i, int j, int a, int b, int p,
+                            int ni_m, int ni_s, int nj_m, int nj_s, int64_t dE) {
+            bool is_t = (tabu[i * 8 + ni_m * 2 + (ni_s > 0)] > step) ||
+                        (tabu[j * 8 + nj_m * 2 + (nj_s > 0)] > step);
+            if (is_t && st.E + dE >= best_E) return;
+            if (dE < best.dE || (dE == best.dE && (rng() % (++ties + 1) == 0))) {
+                if (dE < best.dE) ties = 0;
+                best = {type, i, j, a, b, p, dE, dE};
+            }
+        };
+        for (int u = 0; u < 2; ++u) {
+            int a = mats[u], b = mats[1 - u];
+            for (int i : pos[u]) {
+                for (int j : neg[u]) {
+                    consider(1, i, j, a, a, 0, a, -1, a, 1, st.eval_move1(i, j, a));
+                    consider(3, i, j, a, b, 0, b, 1, b, -1, st.eval_move3(i, j, a, b, 0));
+                    consider(3, i, j, a, b, 1, b, -1, b, 1, st.eval_move3(i, j, a, b, 1));
+                }
+            }
+        }
+        for (int i : pos[0])
+            for (int j : pos[1])
+                consider(2, i, j, ma, mb, 1, mb, 1, ma, 1, st.eval_move2(i, j, ma, mb, 1));
+        for (int i : neg[0])
+            for (int j : neg[1])
+                consider(2, i, j, ma, mb, -1, mb, -1, ma, -1, st.eval_move2(i, j, ma, mb, -1));
+        if (best.type == 0) break;
+        int omi = st.mat[best.i], osi = st.sgn[best.i], omj = st.mat[best.j], osj = st.sgn[best.j];
+        apply_move(st, best);
+        int tv = tenure + (int)(rng() % 3);
+        tabu[best.i * 8 + omi * 2 + (osi > 0)] = step + tv;
+        tabu[best.j * 8 + omj * 2 + (osj > 0)] = step + tv;
+        if (st.E < best_E) {
+            best_E = st.E;
+            best_st = st;
+        }
+    }
+    if (best_E < st.E) st = std::move(best_st);
+}
+
+static uint64_t hash_state(const State& st) {
+    uint64_t h = 0x9e3779b97f4a7c15ULL;
+    for (int i = 1; i < st.r; ++i) {
+        uint64_t v = (uint64_t)(st.mat[i] * 2 + (st.sgn[i] > 0 ? 1 : 0));
+        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+    }
+    return h;
+}
+
 static void worker_tabu(int tid, const Instance* inst, double max_secs, const std::string& out_path) {
     auto t_start = std::chrono::steady_clock::now();
     std::mt19937_64 rng(0x9e3779b97f4a7c15ULL ^ ((uint64_t)(tid + 1) * 0xbf58476d1ce4e5b9ULL));
@@ -711,10 +863,13 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
     int iter = 0;
     int stall = 0;
     int kicks_since_improve = 0;
-    const int tenure = std::max(4, inst->r / 6);
-    const int kick_limit = std::max(600, inst->r * 25);
-    const int64_t polish_thresh = (inst->K <= 16) ? 10 : 32;
+    const int tenure = std::max(4, inst->r / 8);
+    const int kick_limit = std::max(200, inst->r * 6);
+    const int64_t polish_thresh = (inst->K <= 16) ? 8 : 32;
     const int64_t deep_polish_thresh = (inst->K <= 16) ? 4 : 16;
+    const int64_t diag_lo1 = (inst->K <= 16) ? 4 : 32;
+    const int64_t diag_lo2 = (inst->K <= 16) ? 2 : 28;
+    std::unordered_set<uint64_t> seen_lo1, seen_lo2;
 
     std::vector<int> pos[4], neg[4];
 
@@ -752,19 +907,18 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
             }
         };
 
-        // Move 1: same-matrix sign swaps & Move 3: zero-sum pair transfers
+        // Fused Move 1 + Move 3 evaluation
+        int64_t dW3[4][2], dE3[4][2];
         for (int a = 0; a < 4; ++a) {
             for (int i : pos[a]) {
                 for (int j : neg[a]) {
-                    int64_t dW, dE;
-                    st.eval_move1_both(i, j, a, wptr, dW, dE);
-                    consider(1, i, j, a, a, 0, a, -1, a, 1, dW, dE);
+                    int64_t dW1, dE1;
+                    st.eval_move1_and_3_all(i, j, a, wptr, dW1, dE1, dW3, dE3);
+                    consider(1, i, j, a, a, 0, a, -1, a, 1, dW1, dE1);
                     for (int b = 0; b < 4; ++b) {
                         if (b == a) continue;
-                        st.eval_move3_both(i, j, a, b, 0, wptr, dW, dE);
-                        consider(3, i, j, a, b, 0, b, 1, b, -1, dW, dE);
-                        st.eval_move3_both(i, j, a, b, 1, wptr, dW, dE);
-                        consider(3, i, j, a, b, 1, b, -1, b, 1, dW, dE);
+                        consider(3, i, j, a, b, 0, b, 1, b, -1, dW3[b][0], dE3[b][0]);
+                        consider(3, i, j, a, b, 1, b, -1, b, 1, dW3[b][1], dE3[b][1]);
                     }
                 }
             }
@@ -801,9 +955,14 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
         set_assign_tabu(best.i, old_mi, old_si, iter + t_val);
         set_assign_tabu(best.j, old_mj, old_sj, iter + t_val);
 
+        if (st.E <= diag_lo1) seen_lo1.insert(hash_state(st));
+        if (st.E <= diag_lo2) seen_lo2.insert(hash_state(st));
+
         if (st.E < basin_best) {
             if (st.E > 0 && st.E <= polish_thresh) {
                 polish_2move(st, st.E <= deep_polish_thresh ? 512 : 24);
+                if (st.E <= diag_lo1) seen_lo1.insert(hash_state(st));
+                if (st.E <= diag_lo2) seen_lo2.insert(hash_state(st));
             }
             basin_best = st.E;
             stall = 0;
@@ -816,30 +975,36 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
             if (st.E == 0) return;
         } else {
             ++stall;
-            // Guided Local Search weight bump on stalled worst shift
-            if (stall % 60 == 0) {
-                int worst_k = 0;
-                double worst_util = -1.0;
-                for (int k = 0; k < inst->K; ++k) {
-                    double u = (double)(1LL * st.P[k] * st.P[k]) / (double)W[k];
-                    if (u > worst_util) { worst_util = u; worst_k = k; }
-                }
-                if (W[worst_k] < 16) W[worst_k] += 1;
-                weighted = true;
-            }
             if (stall >= kick_limit) {
                 for (int k = 0; k < inst->K; ++k) W[k] = 1;
                 weighted = false;
                 ++kicks_since_improve;
-                if (kicks_since_improve >= 10 || rng() % 4 == 0) {
+                if (kicks_since_improve >= 4 || rng() % 2 == 0) {
                     st.init_random(rng);
                     best_st = st;
                     basin_best = st.E;
                     kicks_since_improve = 0;
-                } else {
-                    // ILS kick from best_st: 2..6 random valid moves
+                } else if (rng() % 2 == 0) {
+                    // 2-Matrix LNS escape from best_st: hold 2 matrices fixed, re-optimize the other 2!
                     st = best_st;
-                    int n_kicks = 2 + (int)(rng() % 5);
+                    int ma = (int)(rng() & 3ULL);
+                    int mb = (ma + 1 + (int)(rng() % 3)) & 3;
+                    lns_pair_tabu(st, ma, mb, 60, rng);
+                    if (st.E > 0 && st.E <= deep_polish_thresh) polish_2move(st, 512);
+                    if (st.E <= diag_lo1) seen_lo1.insert(hash_state(st));
+                    if (st.E <= diag_lo2) seen_lo2.insert(hash_state(st));
+                    if (st.E < best_st.E) {
+                        best_st = st;
+                        kicks_since_improve = 0;
+                        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                        report_best(st, out_path, "tabu-lns", tid, el, iter);
+                        if (st.E == 0) return;
+                    }
+                    basin_best = st.E;
+                } else {
+                    // ILS kick from best_st: 3..6 random valid moves
+                    st = best_st;
+                    int n_kicks = 3 + (int)(rng() % 4);
                     for (int kk = 0; kk < n_kicks; ++kk) {
                         for (int a = 0; a < 4; ++a) { pos[a].clear(); neg[a].clear(); }
                         for (int i = 1; i < inst->r; ++i) {
@@ -867,6 +1032,12 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
             }
         }
     }
+    double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+    std::lock_guard<std::mutex> lock(g_io_mtx);
+    std::cout << "[tabu-T" << tid << " stats] iters=" << iter
+              << " (" << (el > 0 ? iter / el : 0.0) << " iters/s)"
+              << ", distinct E<=" << diag_lo1 << ": " << seen_lo1.size()
+              << ", distinct E<=" << diag_lo2 << ": " << seen_lo2.size() << std::endl;
 }
 
 static void worker_sa(int tid, const Instance* inst, double max_secs, const std::string& out_path) {
