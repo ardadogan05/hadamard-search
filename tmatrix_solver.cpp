@@ -23,6 +23,24 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+#ifdef __AVX2__
+static inline int64_t hsum_epi32_to_64(__m256i v) {
+    // Sign-extend lower 4 and upper 4 int32 lanes to int64 and sum
+    __m128i lo = _mm256_castsi256_si128(v);
+    __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m256i lo64 = _mm256_cvtepi32_epi64(lo);
+    __m256i hi64 = _mm256_cvtepi32_epi64(hi);
+    __m256i s = _mm256_add_epi64(lo64, hi64);
+    __m128i s_lo = _mm256_castsi256_si128(s);
+    __m128i s_hi = _mm256_extracti128_si256(s, 1);
+    __m128i s2 = _mm_add_epi64(s_lo, s_hi);
+    return _mm_cvtsi128_si64(s2) + _mm_extract_epi64(s2, 1);
+}
+#endif
 
 struct Instance {
     int t, g, h, r, K;
@@ -178,57 +196,81 @@ struct State {
 
     // Helper to add (delta_s * MT[o][l][k]) to C[m][l][k] for all l != o
     inline void update_C_orbit(int m, int o, int delta_s) {
-        int* C_m = &C[m * r * K_pad];
-        const int* MT_o = &inst->MT[o * r * K_pad];
+        int* __restrict__ C_m = &C[m * r * K_pad];
+        const int* __restrict__ MT_o = &inst->MT[o * r * K_pad];
         if (delta_s == 1) {
             for (int l = 0; l < r; ++l) {
                 if (l == o) continue;
-                int* dst = C_m + l * K_pad;
-                const int* src = MT_o + l * K_pad;
-                for (int k = 0; k < K; ++k) dst[k] += src[k];
+                int* __restrict__ dst = C_m + l * K_pad;
+                const int* __restrict__ src = MT_o + l * K_pad;
+                for (int k = 0; k < K_pad; ++k) dst[k] += src[k];
             }
         } else if (delta_s == -1) {
             for (int l = 0; l < r; ++l) {
                 if (l == o) continue;
-                int* dst = C_m + l * K_pad;
-                const int* src = MT_o + l * K_pad;
-                for (int k = 0; k < K; ++k) dst[k] -= src[k];
+                int* __restrict__ dst = C_m + l * K_pad;
+                const int* __restrict__ src = MT_o + l * K_pad;
+                for (int k = 0; k < K_pad; ++k) dst[k] -= src[k];
             }
         } else if (delta_s == 2) {
             for (int l = 0; l < r; ++l) {
                 if (l == o) continue;
-                int* dst = C_m + l * K_pad;
-                const int* src = MT_o + l * K_pad;
-                for (int k = 0; k < K; ++k) dst[k] += 2 * src[k];
+                int* __restrict__ dst = C_m + l * K_pad;
+                const int* __restrict__ src = MT_o + l * K_pad;
+                for (int k = 0; k < K_pad; ++k) dst[k] += 2 * src[k];
             }
         } else if (delta_s == -2) {
             for (int l = 0; l < r; ++l) {
                 if (l == o) continue;
-                int* dst = C_m + l * K_pad;
-                const int* src = MT_o + l * K_pad;
-                for (int k = 0; k < K; ++k) dst[k] -= 2 * src[k];
+                int* __restrict__ dst = C_m + l * K_pad;
+                const int* __restrict__ src = MT_o + l * K_pad;
+                for (int k = 0; k < K_pad; ++k) dst[k] -= 2 * src[k];
             }
         }
     }
 
     // Move 1: Same-matrix sign swap: mat[i]==mat[j]==a, sgn[i]==+1, sgn[j]==-1
-    inline int64_t eval_move1(int i, int j, int a, const int* W = nullptr) const {
-        const int* Cai = &C[(a * r + i) * K_pad];
-        const int* Caj = &C[(a * r + j) * K_pad];
-        const int* mij = &inst->MT[(i * r + j) * K_pad];
-        int64_t dE = 0;
-        if (!W) {
-            for (int k = 0; k < K; ++k) {
-                int dp = 2 * (Caj[k] - Cai[k] - 2 * mij[k]);
-                dE += 1LL * dp * (2 * P[k] + dp);
-            }
-        } else {
-            for (int k = 0; k < K; ++k) {
-                int dp = 2 * (Caj[k] - Cai[k] - 2 * mij[k]);
-                dE += 1LL * W[k] * dp * (2 * P[k] + dp);
+    inline void eval_move1_both(int i, int j, int a, const int* __restrict__ W, int64_t& dW_out, int64_t& dE_out) const {
+        const int* __restrict__ Cai = &C[(a * r + i) * K_pad];
+        const int* __restrict__ Caj = &C[(a * r + j) * K_pad];
+        const int* __restrict__ mij = &inst->MT[(i * r + j) * K_pad];
+        const int* __restrict__ pptr = P.data();
+        int64_t dE = 0, dW = 0;
+#ifdef __AVX2__
+        __m256i accE = _mm256_setzero_si256();
+        __m256i accW = _mm256_setzero_si256();
+        for (int k = 0; k < K_pad; k += 8) {
+            __m256i vcai = _mm256_loadu_si256((const __m256i*)(Cai + k));
+            __m256i vcaj = _mm256_loadu_si256((const __m256i*)(Caj + k));
+            __m256i vmij = _mm256_loadu_si256((const __m256i*)(mij + k));
+            __m256i vp = _mm256_loadu_si256((const __m256i*)(pptr + k));
+            __m256i vdp = _mm256_slli_epi32(_mm256_sub_epi32(_mm256_sub_epi32(vcaj, vcai), _mm256_slli_epi32(vmij, 1)), 1);
+            __m256i vterm = _mm256_mullo_epi32(vdp, _mm256_add_epi32(_mm256_slli_epi32(vp, 1), vdp));
+            accE = _mm256_add_epi32(accE, vterm);
+            if (W) {
+                __m256i vw = _mm256_loadu_si256((const __m256i*)(W + k));
+                accW = _mm256_add_epi32(accW, _mm256_mullo_epi32(vw, vterm));
             }
         }
-        return dE;
+        dE = hsum_epi32_to_64(accE);
+        dW = W ? hsum_epi32_to_64(accW) : dE;
+#else
+        for (int k = 0; k < K; ++k) {
+            int dp = 2 * (Caj[k] - Cai[k] - 2 * mij[k]);
+            int64_t term = 1LL * dp * (2 * pptr[k] + dp);
+            dE += term;
+            if (W) dW += 1LL * W[k] * term;
+        }
+        if (!W) dW = dE;
+#endif
+        dE_out = dE;
+        dW_out = dW;
+    }
+
+    inline int64_t eval_move1(int i, int j, int a, const int* W = nullptr) const {
+        int64_t dW, dE;
+        eval_move1_both(i, j, a, W, dW, dE);
+        return W ? dW : dE;
     }
 
     void apply_move1(int i, int j, int a) {
@@ -247,25 +289,53 @@ struct State {
     }
 
     // Move 2: Cross-matrix same-sign swap: mat[i]==a, mat[j]==b, a!=b, sgn[i]==sgn[j]==eps
-    inline int64_t eval_move2(int i, int j, int a, int b, int eps, const int* W = nullptr) const {
-        const int* Cai = &C[(a * r + i) * K_pad];
-        const int* Cbi = &C[(b * r + i) * K_pad];
-        const int* Caj = &C[(a * r + j) * K_pad];
-        const int* Cbj = &C[(b * r + j) * K_pad];
-        const int* mij = &inst->MT[(i * r + j) * K_pad];
-        int64_t dE = 0;
-        if (!W) {
-            for (int k = 0; k < K; ++k) {
-                int dp = eps * (Cbi[k] - Cai[k] + Caj[k] - Cbj[k]) - 2 * mij[k];
-                dE += 1LL * dp * (2 * P[k] + dp);
-            }
-        } else {
-            for (int k = 0; k < K; ++k) {
-                int dp = eps * (Cbi[k] - Cai[k] + Caj[k] - Cbj[k]) - 2 * mij[k];
-                dE += 1LL * W[k] * dp * (2 * P[k] + dp);
+    inline void eval_move2_both(int i, int j, int a, int b, int eps, const int* __restrict__ W, int64_t& dW_out, int64_t& dE_out) const {
+        const int* __restrict__ Cai = &C[(a * r + i) * K_pad];
+        const int* __restrict__ Cbi = &C[(b * r + i) * K_pad];
+        const int* __restrict__ Caj = &C[(a * r + j) * K_pad];
+        const int* __restrict__ Cbj = &C[(b * r + j) * K_pad];
+        const int* __restrict__ mij = &inst->MT[(i * r + j) * K_pad];
+        const int* __restrict__ pptr = P.data();
+        int64_t dE = 0, dW = 0;
+#ifdef __AVX2__
+        __m256i accE = _mm256_setzero_si256();
+        __m256i accW = _mm256_setzero_si256();
+        for (int k = 0; k < K_pad; k += 8) {
+            __m256i vcai = _mm256_loadu_si256((const __m256i*)(Cai + k));
+            __m256i vcbi = _mm256_loadu_si256((const __m256i*)(Cbi + k));
+            __m256i vcaj = _mm256_loadu_si256((const __m256i*)(Caj + k));
+            __m256i vcbj = _mm256_loadu_si256((const __m256i*)(Cbj + k));
+            __m256i vmij = _mm256_loadu_si256((const __m256i*)(mij + k));
+            __m256i vp = _mm256_loadu_si256((const __m256i*)(pptr + k));
+            __m256i vdiff = _mm256_add_epi32(_mm256_sub_epi32(vcbi, vcai), _mm256_sub_epi32(vcaj, vcbj));
+            if (eps < 0) vdiff = _mm256_sub_epi32(_mm256_setzero_si256(), vdiff);
+            __m256i vdp = _mm256_sub_epi32(vdiff, _mm256_slli_epi32(vmij, 1));
+            __m256i vterm = _mm256_mullo_epi32(vdp, _mm256_add_epi32(_mm256_slli_epi32(vp, 1), vdp));
+            accE = _mm256_add_epi32(accE, vterm);
+            if (W) {
+                __m256i vw = _mm256_loadu_si256((const __m256i*)(W + k));
+                accW = _mm256_add_epi32(accW, _mm256_mullo_epi32(vw, vterm));
             }
         }
-        return dE;
+        dE = hsum_epi32_to_64(accE);
+        dW = W ? hsum_epi32_to_64(accW) : dE;
+#else
+        for (int k = 0; k < K; ++k) {
+            int dp = eps * (Cbi[k] - Cai[k] + Caj[k] - Cbj[k]) - 2 * mij[k];
+            int64_t term = 1LL * dp * (2 * pptr[k] + dp);
+            dE += term;
+            if (W) dW += 1LL * W[k] * term;
+        }
+        if (!W) dW = dE;
+#endif
+        dE_out = dE;
+        dW_out = dW;
+    }
+
+    inline int64_t eval_move2(int i, int j, int a, int b, int eps, const int* W = nullptr) const {
+        int64_t dW, dE;
+        eval_move2_both(i, j, a, b, eps, W, dW, dE);
+        return W ? dW : dE;
     }
 
     void apply_move2(int i, int j, int a, int b, int eps) {
@@ -289,26 +359,55 @@ struct State {
 
     // Move 3: Zero-sum pair transfer: mat[i]==mat[j]==a, sgn[i]==+1, sgn[j]==-1 -> move both to b!=a
     // flip_b == 0 -> (+1, -1) in b; flip_b == 1 -> (-1, +1) in b
-    inline int64_t eval_move3(int i, int j, int a, int b, int flip_b, const int* W = nullptr) const {
-        const int* Cai = &C[(a * r + i) * K_pad];
-        const int* Caj = &C[(a * r + j) * K_pad];
-        const int* Cbi = &C[(b * r + i) * K_pad];
-        const int* Cbj = &C[(b * r + j) * K_pad];
-        const int* mij = &inst->MT[(i * r + j) * K_pad];
-        int64_t dE = 0;
+    inline void eval_move3_both(int i, int j, int a, int b, int flip_b, const int* __restrict__ W, int64_t& dW_out, int64_t& dE_out) const {
+        const int* __restrict__ Cai = &C[(a * r + i) * K_pad];
+        const int* __restrict__ Caj = &C[(a * r + j) * K_pad];
+        const int* __restrict__ Cbi = &C[(b * r + i) * K_pad];
+        const int* __restrict__ Cbj = &C[(b * r + j) * K_pad];
+        const int* __restrict__ mij = &inst->MT[(i * r + j) * K_pad];
+        const int* __restrict__ pptr = P.data();
+        int64_t dE = 0, dW = 0;
         int fb = flip_b ? -1 : 1;
-        if (!W) {
-            for (int k = 0; k < K; ++k) {
-                int dp = fb * (Cbi[k] - Cbj[k]) + (Caj[k] - Cai[k] - 2 * mij[k]);
-                dE += 1LL * dp * (2 * P[k] + dp);
-            }
-        } else {
-            for (int k = 0; k < K; ++k) {
-                int dp = fb * (Cbi[k] - Cbj[k]) + (Caj[k] - Cai[k] - 2 * mij[k]);
-                dE += 1LL * W[k] * dp * (2 * P[k] + dp);
+#ifdef __AVX2__
+        __m256i accE = _mm256_setzero_si256();
+        __m256i accW = _mm256_setzero_si256();
+        for (int k = 0; k < K_pad; k += 8) {
+            __m256i vcai = _mm256_loadu_si256((const __m256i*)(Cai + k));
+            __m256i vcaj = _mm256_loadu_si256((const __m256i*)(Caj + k));
+            __m256i vcbi = _mm256_loadu_si256((const __m256i*)(Cbi + k));
+            __m256i vcbj = _mm256_loadu_si256((const __m256i*)(Cbj + k));
+            __m256i vmij = _mm256_loadu_si256((const __m256i*)(mij + k));
+            __m256i vp = _mm256_loadu_si256((const __m256i*)(pptr + k));
+            __m256i vb = _mm256_sub_epi32(vcbi, vcbj);
+            if (fb < 0) vb = _mm256_sub_epi32(_mm256_setzero_si256(), vb);
+            __m256i va = _mm256_sub_epi32(_mm256_sub_epi32(vcaj, vcai), _mm256_slli_epi32(vmij, 1));
+            __m256i vdp = _mm256_add_epi32(vb, va);
+            __m256i vterm = _mm256_mullo_epi32(vdp, _mm256_add_epi32(_mm256_slli_epi32(vp, 1), vdp));
+            accE = _mm256_add_epi32(accE, vterm);
+            if (W) {
+                __m256i vw = _mm256_loadu_si256((const __m256i*)(W + k));
+                accW = _mm256_add_epi32(accW, _mm256_mullo_epi32(vw, vterm));
             }
         }
-        return dE;
+        dE = hsum_epi32_to_64(accE);
+        dW = W ? hsum_epi32_to_64(accW) : dE;
+#else
+        for (int k = 0; k < K; ++k) {
+            int dp = fb * (Cbi[k] - Cbj[k]) + (Caj[k] - Cai[k] - 2 * mij[k]);
+            int64_t term = 1LL * dp * (2 * pptr[k] + dp);
+            dE += term;
+            if (W) dW += 1LL * W[k] * term;
+        }
+        if (!W) dW = dE;
+#endif
+        dE_out = dE;
+        dW_out = dW;
+    }
+
+    inline int64_t eval_move3(int i, int j, int a, int b, int flip_b, const int* W = nullptr) const {
+        int64_t dW, dE;
+        eval_move3_both(i, j, a, b, flip_b, W, dW, dE);
+        return W ? dW : dE;
     }
 
     void apply_move3(int i, int j, int a, int b, int flip_b) {
@@ -446,7 +545,13 @@ static void report_best(const State& st, const std::string& out_path, const char
     }
     g_best_E.store(st.E, std::memory_order_relaxed);
     std::cout << "[" << mode << "-T" << tid << " " << elapsed << "s step=" << step
-              << "] new best E=" << st.E << std::endl;
+              << "] new best E=" << st.E;
+    if (st.E <= 8) {
+        std::cout << " P=[";
+        for (int k = 0; k < st.K; ++k) std::cout << st.P[k] << (k + 1 < st.K ? "," : "");
+        std::cout << "]";
+    }
+    std::cout << std::endl;
     if (st.E == 0) {
         g_witness_failed = !save_witness(out_path, *st.inst, st);
         if (g_witness_failed)
@@ -465,24 +570,160 @@ struct BestMove {
     int64_t dE = (1LL << 60);
 };
 
+static inline void apply_move(State& st, const BestMove& m) {
+    if (m.type == 1) st.apply_move1(m.i, m.j, m.a);
+    else if (m.type == 2) st.apply_move2(m.i, m.j, m.a, m.b, m.p);
+    else if (m.type == 3) st.apply_move3(m.i, m.j, m.a, m.b, m.p);
+}
+
+// Steepest 1-move descent + exact 2-move lookahead from top-24 1-moves when E is low.
+static bool polish_2move(State& st, int top_k = 24) {
+    const Instance* inst = st.inst;
+    std::vector<int> pos[4], neg[4];
+    bool improved_any = false;
+    while (st.E > 0) {
+        for (int a = 0; a < 4; ++a) { pos[a].clear(); neg[a].clear(); }
+        for (int i = 1; i < inst->r; ++i) {
+            if (st.sgn[i] == 1) pos[st.mat[i]].push_back(i);
+            else neg[st.mat[i]].push_back(i);
+        }
+        std::vector<BestMove> cands;
+        cands.reserve(512);
+        BestMove best1;
+        for (int a = 0; a < 4; ++a) {
+            for (int i : pos[a]) {
+                for (int j : neg[a]) {
+                    int64_t dE = st.eval_move1(i, j, a);
+                    if (dE < best1.dE) best1 = {1, i, j, a, a, 0, dE, dE};
+                    cands.push_back({1, i, j, a, a, 0, dE, dE});
+                }
+            }
+        }
+        for (int a = 0; a < 4; ++a) {
+            for (int b = a + 1; b < 4; ++b) {
+                for (int i : pos[a]) {
+                    for (int j : pos[b]) {
+                        int64_t dE = st.eval_move2(i, j, a, b, 1);
+                        if (dE < best1.dE) best1 = {2, i, j, a, b, 1, dE, dE};
+                        cands.push_back({2, i, j, a, b, 1, dE, dE});
+                    }
+                }
+                for (int i : neg[a]) {
+                    for (int j : neg[b]) {
+                        int64_t dE = st.eval_move2(i, j, a, b, -1);
+                        if (dE < best1.dE) best1 = {2, i, j, a, b, -1, dE, dE};
+                        cands.push_back({2, i, j, a, b, -1, dE, dE});
+                    }
+                }
+            }
+        }
+        for (int a = 0; a < 4; ++a) {
+            for (int i : pos[a]) {
+                for (int j : neg[a]) {
+                    for (int b = 0; b < 4; ++b) {
+                        if (b == a) continue;
+                        for (int fb = 0; fb < 2; ++fb) {
+                            int64_t dE = st.eval_move3(i, j, a, b, fb);
+                            if (dE < best1.dE) best1 = {3, i, j, a, b, fb, dE, dE};
+                            cands.push_back({3, i, j, a, b, fb, dE, dE});
+                        }
+                    }
+                }
+            }
+        }
+        if (best1.dE < 0) {
+            apply_move(st, best1);
+            improved_any = true;
+            continue;
+        }
+        // Try 2-move lookahead from top_k candidates
+        int lim = std::min<int>((int)cands.size(), top_k);
+        std::partial_sort(cands.begin(), cands.begin() + lim, cands.end(),
+                          [](const BestMove& x, const BestMove& y) { return x.dE < y.dE; });
+        int64_t best2_E = st.E;
+        BestMove best_m1, best_m2;
+        std::vector<int> p2[4], n2[4];
+        for (int ci = 0; ci < lim; ++ci) {
+            State tmp = st;
+            apply_move(tmp, cands[ci]);
+            for (int a = 0; a < 4; ++a) { p2[a].clear(); n2[a].clear(); }
+            for (int i = 1; i < inst->r; ++i) {
+                if (tmp.sgn[i] == 1) p2[tmp.mat[i]].push_back(i);
+                else n2[tmp.mat[i]].push_back(i);
+            }
+            auto check2 = [&](int type, int i, int j, int a, int b, int p, int64_t dE2) {
+                if (tmp.E + dE2 < best2_E) {
+                    best2_E = tmp.E + dE2;
+                    best_m1 = cands[ci];
+                    best_m2 = {type, i, j, a, b, p, dE2, dE2};
+                }
+            };
+            for (int a = 0; a < 4; ++a) {
+                for (int i : p2[a]) {
+                    for (int j : n2[a]) {
+                        check2(1, i, j, a, a, 0, tmp.eval_move1(i, j, a));
+                        for (int b = 0; b < 4; ++b) {
+                            if (b == a) continue;
+                            check2(3, i, j, a, b, 0, tmp.eval_move3(i, j, a, b, 0));
+                            check2(3, i, j, a, b, 1, tmp.eval_move3(i, j, a, b, 1));
+                        }
+                    }
+                }
+            }
+            for (int a = 0; a < 4; ++a) {
+                for (int b = a + 1; b < 4; ++b) {
+                    for (int i : p2[a])
+                        for (int j : p2[b])
+                            check2(2, i, j, a, b, 1, tmp.eval_move2(i, j, a, b, 1));
+                    for (int i : n2[a])
+                        for (int j : n2[b])
+                            check2(2, i, j, a, b, -1, tmp.eval_move2(i, j, a, b, -1));
+                }
+            }
+            if (best2_E == 0) break;
+        }
+        if (best2_E < st.E) {
+            apply_move(st, best_m1);
+            apply_move(st, best_m2);
+            improved_any = true;
+        } else {
+            break;
+        }
+    }
+    return improved_any;
+}
+
 static void worker_tabu(int tid, const Instance* inst, double max_secs, const std::string& out_path) {
     auto t_start = std::chrono::steady_clock::now();
     std::mt19937_64 rng(0x9e3779b97f4a7c15ULL ^ ((uint64_t)(tid + 1) * 0xbf58476d1ce4e5b9ULL));
 
     State st(inst);
     st.init_random(rng);
-    std::vector<int> tabu(inst->r, 0);
-    std::vector<int> W(inst->K, 1);
+    State best_st = st;
+    // Assignment-based tabu: tabu[orbit * 8 + mat * 2 + (sgn > 0 ? 1 : 0)]
+    std::vector<int> tabu(inst->r * 8, 0);
+    std::vector<int> W(inst->K_pad, 1);
+    for (int k = inst->K; k < inst->K_pad; ++k) W[k] = 0;
 
-    int64_t local_best = st.E;
+    int64_t basin_best = st.E;
     report_best(st, out_path, "tabu", tid, 0, 0);
     bool weighted = false;
     int iter = 0;
     int stall = 0;
-    int tenure = std::max(5, inst->r / 4);
-    int kick_limit = std::max(800, inst->r * 40);
+    int kicks_since_improve = 0;
+    const int tenure = std::max(4, inst->r / 6);
+    const int kick_limit = std::max(600, inst->r * 25);
+    const int64_t polish_thresh = (inst->K <= 16) ? 10 : 32;
+    const int64_t deep_polish_thresh = (inst->K <= 16) ? 4 : 16;
 
     std::vector<int> pos[4], neg[4];
+
+    auto is_assign_tabu = [&](int o, int m, int s) -> bool {
+        return tabu[o * 8 + m * 2 + (s > 0 ? 1 : 0)] > iter;
+    };
+    auto set_assign_tabu = [&](int o, int m, int s, int until) {
+        tabu[o * 8 + m * 2 + (s > 0 ? 1 : 0)] = until;
+    };
 
     while (!g_found.load(std::memory_order_relaxed)) {
         if ((iter & 255) == 0) {
@@ -499,23 +740,32 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
 
         BestMove best;
         uint64_t tie_cnt = 0;
+        const int* wptr = weighted ? W.data() : nullptr;
 
-        auto consider = [&](int type, int i, int j, int a, int b, int p, int64_t dW, int64_t dE) {
-            bool is_tabu = (tabu[i] > iter || tabu[j] > iter);
-            if (is_tabu && (st.E + dE >= local_best)) return;
+        auto consider = [&](int type, int i, int j, int a, int b, int p,
+                            int ni_m, int ni_s, int nj_m, int nj_s, int64_t dW, int64_t dE) {
+            bool is_tabu = is_assign_tabu(i, ni_m, ni_s) || is_assign_tabu(j, nj_m, nj_s);
+            if (is_tabu && (st.E + dE >= basin_best)) return;
             if (dW < best.dW || (dW == best.dW && (dE < best.dE || (dE == best.dE && (rng() % (++tie_cnt + 1) == 0))))) {
                 if (dW < best.dW || dE < best.dE) tie_cnt = 0;
                 best = {type, i, j, a, b, p, dW, dE};
             }
         };
 
-        // Move 1: same-matrix sign swaps
+        // Move 1: same-matrix sign swaps & Move 3: zero-sum pair transfers
         for (int a = 0; a < 4; ++a) {
             for (int i : pos[a]) {
                 for (int j : neg[a]) {
-                    int64_t dW = st.eval_move1(i, j, a, weighted ? W.data() : nullptr);
-                    int64_t dE = weighted ? st.eval_move1(i, j, a) : dW;
-                    consider(1, i, j, a, a, 0, dW, dE);
+                    int64_t dW, dE;
+                    st.eval_move1_both(i, j, a, wptr, dW, dE);
+                    consider(1, i, j, a, a, 0, a, -1, a, 1, dW, dE);
+                    for (int b = 0; b < 4; ++b) {
+                        if (b == a) continue;
+                        st.eval_move3_both(i, j, a, b, 0, wptr, dW, dE);
+                        consider(3, i, j, a, b, 0, b, 1, b, -1, dW, dE);
+                        st.eval_move3_both(i, j, a, b, 1, wptr, dW, dE);
+                        consider(3, i, j, a, b, 1, b, -1, b, 1, dW, dE);
+                    }
                 }
             }
         }
@@ -524,72 +774,73 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
             for (int b = a + 1; b < 4; ++b) {
                 for (int i : pos[a]) {
                     for (int j : pos[b]) {
-                        int64_t dW = st.eval_move2(i, j, a, b, 1, weighted ? W.data() : nullptr);
-                        int64_t dE = weighted ? st.eval_move2(i, j, a, b, 1) : dW;
-                        consider(2, i, j, a, b, 1, dW, dE);
+                        int64_t dW, dE;
+                        st.eval_move2_both(i, j, a, b, 1, wptr, dW, dE);
+                        consider(2, i, j, a, b, 1, b, 1, a, 1, dW, dE);
                     }
                 }
                 for (int i : neg[a]) {
                     for (int j : neg[b]) {
-                        int64_t dW = st.eval_move2(i, j, a, b, -1, weighted ? W.data() : nullptr);
-                        int64_t dE = weighted ? st.eval_move2(i, j, a, b, -1) : dW;
-                        consider(2, i, j, a, b, -1, dW, dE);
-                    }
-                }
-            }
-        }
-        // Move 3: zero-sum pair transfers (only evaluate when best isn't already huge improvement or always for r<=45)
-        for (int a = 0; a < 4; ++a) {
-            for (int i : pos[a]) {
-                for (int j : neg[a]) {
-                    for (int b = 0; b < 4; ++b) {
-                        if (b == a) continue;
-                        for (int fb = 0; fb < 2; ++fb) {
-                            int64_t dW = st.eval_move3(i, j, a, b, fb, weighted ? W.data() : nullptr);
-                            int64_t dE = weighted ? st.eval_move3(i, j, a, b, fb) : dW;
-                            consider(3, i, j, a, b, fb, dW, dE);
-                        }
+                        int64_t dW, dE;
+                        st.eval_move2_both(i, j, a, b, -1, wptr, dW, dE);
+                        consider(2, i, j, a, b, -1, b, -1, a, -1, dW, dE);
                     }
                 }
             }
         }
 
-        if (best.type == 1) st.apply_move1(best.i, best.j, best.a);
-        else if (best.type == 2) st.apply_move2(best.i, best.j, best.a, best.b, best.p);
-        else if (best.type == 3) st.apply_move3(best.i, best.j, best.a, best.b, best.p);
+        if (best.type == 0) {
+            std::fill(tabu.begin(), tabu.end(), 0);
+            continue;
+        }
 
-        int t_val = tenure + (int)(rng() % 5);
-        tabu[best.i] = iter + t_val;
-        tabu[best.j] = iter + t_val;
+        int old_mi = st.mat[best.i], old_si = st.sgn[best.i];
+        int old_mj = st.mat[best.j], old_sj = st.sgn[best.j];
+        apply_move(st, best);
+        int t_val = tenure + (int)(rng() % 4);
+        set_assign_tabu(best.i, old_mi, old_si, iter + t_val);
+        set_assign_tabu(best.j, old_mj, old_sj, iter + t_val);
 
-        if (st.E < local_best) {
-            local_best = st.E;
+        if (st.E < basin_best) {
+            if (st.E > 0 && st.E <= polish_thresh) {
+                polish_2move(st, st.E <= deep_polish_thresh ? 512 : 24);
+            }
+            basin_best = st.E;
             stall = 0;
+            if (st.E <= best_st.E) {
+                if (st.E < best_st.E) kicks_since_improve = 0;
+                best_st = st;
+            }
             double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
             report_best(st, out_path, "tabu", tid, el, iter);
+            if (st.E == 0) return;
         } else {
             ++stall;
             // Guided Local Search weight bump on stalled worst shift
-            if (stall % 150 == 0) {
+            if (stall % 60 == 0) {
                 int worst_k = 0;
                 double worst_util = -1.0;
                 for (int k = 0; k < inst->K; ++k) {
                     double u = (double)(1LL * st.P[k] * st.P[k]) / (double)W[k];
                     if (u > worst_util) { worst_util = u; worst_k = k; }
                 }
-                W[worst_k] += 1;
+                if (W[worst_k] < 16) W[worst_k] += 1;
                 weighted = true;
             }
             if (stall >= kick_limit) {
-                // Reset GLS weights and apply random restart or heavy kick
-                std::fill(W.begin(), W.end(), 1);
+                for (int k = 0; k < inst->K; ++k) W[k] = 1;
                 weighted = false;
-                if (rng() % 3 == 0) {
+                ++kicks_since_improve;
+                if (kicks_since_improve >= 10 || rng() % 4 == 0) {
                     st.init_random(rng);
-                    local_best = st.E;
+                    best_st = st;
+                    basin_best = st.E;
+                    kicks_since_improve = 0;
                 } else {
-                    // Apply 8 random moves
-                    for (int kk = 0; kk < 8; ++kk) {
+                    // ILS kick from best_st: 2..6 random valid moves
+                    st = best_st;
+                    int n_kicks = 2 + (int)(rng() % 5);
+                    for (int kk = 0; kk < n_kicks; ++kk) {
                         for (int a = 0; a < 4; ++a) { pos[a].clear(); neg[a].clear(); }
                         for (int i = 1; i < inst->r; ++i) {
                             if (st.sgn[i] == 1) pos[st.mat[i]].push_back(i);
@@ -597,13 +848,17 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
                         }
                         int a = (int)(rng() & 3ULL);
                         int b = (a + 1 + (int)(rng() % 3)) & 3;
-                        if (!pos[a].empty() && !pos[b].empty()) {
+                        int rmode = (int)(rng() % 3);
+                        if (rmode == 0 && !pos[a].empty() && !pos[b].empty()) {
                             st.apply_move2(pos[a][rng() % pos[a].size()], pos[b][rng() % pos[b].size()], a, b, 1);
+                        } else if (rmode == 1 && !neg[a].empty() && !neg[b].empty()) {
+                            st.apply_move2(neg[a][rng() % neg[a].size()], neg[b][rng() % neg[b].size()], a, b, -1);
                         } else if (!pos[a].empty() && !neg[a].empty()) {
-                            st.apply_move1(pos[a][rng() % pos[a].size()], neg[a][rng() % neg[a].size()], a);
+                            if (rng() & 1) st.apply_move3(pos[a][rng() % pos[a].size()], neg[a][rng() % neg[a].size()], a, b, (int)(rng() & 1));
+                            else st.apply_move1(pos[a][rng() % pos[a].size()], neg[a][rng() % neg[a].size()], a);
                         }
                     }
-                    local_best = st.E;
+                    basin_best = st.E;
                 }
                 double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
                 report_best(st, out_path, "tabu", tid, el, iter);
@@ -668,13 +923,14 @@ static void worker_sa(int tid, const Instance* inst, double max_secs, const std:
     rebuild_lists();
 
     // Tight-band reheat SA parameters scaled to K
-    double T_hi = std::max(8.0, 0.8 * inst->K);
-    double T_lo = 0.7;
-    const uint64_t cycle_len = 800000ULL;
+    double T_hi = std::max(5.0, 0.45 * inst->K);
+    double T_lo = 0.8;
+    const uint64_t cycle_len = 600000ULL;
     double alpha = std::pow(T_lo / T_hi, 1.0 / (double)cycle_len);
     double T = T_hi;
     uint64_t step = 0;
     int64_t local_best = st.E;
+    const int64_t polish_thresh = (inst->K <= 16) ? 14 : 44;
     report_best(st, out_path, "sa", tid, 0, 0);
 
     while (!g_found.load(std::memory_order_relaxed)) {
@@ -689,12 +945,7 @@ static void worker_sa(int tid, const Instance* inst, double max_secs, const std:
             if ((step / cycle_len) % 8 == 0) {
                 st.init_random(rng);
                 rebuild_lists();
-                if (st.E < local_best) {
-                    local_best = st.E;
-                    double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-                    report_best(st, out_path, "sa", tid, el, step);
-                    if (st.E == 0) return;
-                }
+                local_best = st.E;
                 T = T_hi;
             } else {
                 T = T_hi * (0.4 + 0.6 * u01(rng));
@@ -767,16 +1018,206 @@ static void worker_sa(int tid, const Instance* inst, double max_secs, const std:
         }
 
         if (st.E < local_best) {
+            if (st.E > 0 && st.E <= polish_thresh) {
+                State pol = st;
+                if (polish_2move(pol, 20) && pol.E < st.E) {
+                    st = std::move(pol);
+                    rebuild_lists();
+                }
+            }
             local_best = st.E;
             double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
             report_best(st, out_path, "sa", tid, el, step);
+            if (st.E == 0) return;
+        }
+    }
+}
+
+struct PtReplica {
+    State st;
+    std::vector<int> pos_list[4], neg_list[4];
+    int pos_sz[4], neg_sz[4];
+    std::vector<int> idx_in_list;
+    uint64_t last_polish_step = 0;
+
+    explicit PtReplica(const Instance* inst) : st(inst), idx_in_list(inst->r, 0) {
+        for (int a = 0; a < 4; ++a) {
+            pos_list[a].resize(inst->r);
+            neg_list[a].resize(inst->r);
+            pos_sz[a] = neg_sz[a] = 0;
+        }
+    }
+    void rebuild_lists() {
+        for (int a = 0; a < 4; ++a) pos_sz[a] = neg_sz[a] = 0;
+        for (int i = 1; i < st.r; ++i) {
+            int a = st.mat[i];
+            if (st.sgn[i] == 1) {
+                idx_in_list[i] = pos_sz[a];
+                pos_list[a][pos_sz[a]++] = i;
+            } else {
+                idx_in_list[i] = neg_sz[a];
+                neg_list[a][neg_sz[a]++] = i;
+            }
+        }
+    }
+    inline void remove_pos(int a, int i) {
+        int p = idx_in_list[i];
+        int last = pos_list[a][--pos_sz[a]];
+        pos_list[a][p] = last;
+        idx_in_list[last] = p;
+    }
+    inline void add_pos(int a, int i) {
+        idx_in_list[i] = pos_sz[a];
+        pos_list[a][pos_sz[a]++] = i;
+    }
+    inline void remove_neg(int a, int i) {
+        int p = idx_in_list[i];
+        int last = neg_list[a][--neg_sz[a]];
+        neg_list[a][p] = last;
+        idx_in_list[last] = p;
+    }
+    inline void add_neg(int a, int i) {
+        idx_in_list[i] = neg_sz[a];
+        neg_list[a][neg_sz[a]++] = i;
+    }
+};
+
+static void worker_pt(int tid, const Instance* inst, double max_secs, const std::string& out_path) {
+    auto t_start = std::chrono::steady_clock::now();
+    std::mt19937_64 rng(0xd1b54a32d192ed03ULL ^ ((uint64_t)(tid + 1) * 0x94d049bb133111ebULL));
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+
+    constexpr int R = 12;
+    const double T_min = (inst->K <= 16) ? 1.2 : 2.0;
+    const double T_max = (inst->K <= 16) ? 20.0 : 36.0;
+    double temps[R];
+    for (int r = 0; r < R; ++r) {
+        temps[r] = T_min * std::pow(T_max / T_min, (double)r / (double)(R - 1));
+    }
+
+    std::vector<PtReplica> reps;
+    reps.reserve(R);
+    int order[R]; // order[slot] = replica index at temperature temps[slot]
+    for (int r = 0; r < R; ++r) {
+        reps.emplace_back(inst);
+        reps.back().st.init_random(rng);
+        reps.back().rebuild_lists();
+        order[r] = r;
+        report_best(reps.back().st, out_path, "pt", tid, 0, 0);
+    }
+
+    const int64_t polish_thresh = (inst->K <= 16) ? 6 : 28;
+    constexpr uint64_t sweep_steps = 2048;
+    uint64_t total_steps = 0;
+    uint64_t sweep = 0;
+
+    while (!g_found.load(std::memory_order_relaxed)) {
+        if ((sweep & 7ULL) == 0) {
+            double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            if (el >= max_secs) break;
+        }
+        ++sweep;
+
+        for (int slot = 0; slot < R && !g_found.load(std::memory_order_relaxed); ++slot) {
+            PtReplica& rep = reps[order[slot]];
+            State& st = rep.st;
+            const double invT = 1.0 / temps[slot];
+            for (uint64_t s = 0; s < sweep_steps; ++s) {
+                ++total_steps;
+                uint64_t rval = rng();
+                int mtype = (int)(rval % 10ULL);
+                rval >>= 4;
+                if (mtype < 3) {
+                    int a = (int)(rval & 3ULL);
+                    if (rep.pos_sz[a] == 0 || rep.neg_sz[a] == 0) continue;
+                    int i = rep.pos_list[a][(rval >> 2) % rep.pos_sz[a]];
+                    int j = rep.neg_list[a][(rval >> 12) % rep.neg_sz[a]];
+                    int64_t dE = st.eval_move1(i, j, a);
+                    if (dE <= 0 || u01(rng) < std::exp(-(double)dE * invT)) {
+                        st.apply_move1(i, j, a);
+                        rep.remove_pos(a, i); rep.add_neg(a, i);
+                        rep.remove_neg(a, j); rep.add_pos(a, j);
+                    } else continue;
+                } else if (mtype < 7) {
+                    int a = (int)(rval & 3ULL);
+                    int b = (a + 1 + (int)((rval >> 2) % 3ULL)) & 3;
+                    int is_pos = (int)((rval >> 4) & 1ULL);
+                    if (is_pos) {
+                        if (rep.pos_sz[a] == 0 || rep.pos_sz[b] == 0) continue;
+                        int i = rep.pos_list[a][(rval >> 5) % rep.pos_sz[a]];
+                        int j = rep.pos_list[b][(rval >> 15) % rep.pos_sz[b]];
+                        int64_t dE = st.eval_move2(i, j, a, b, 1);
+                        if (dE <= 0 || u01(rng) < std::exp(-(double)dE * invT)) {
+                            st.apply_move2(i, j, a, b, 1);
+                            rep.remove_pos(a, i); rep.add_pos(b, i);
+                            rep.remove_pos(b, j); rep.add_pos(a, j);
+                        } else continue;
+                    } else {
+                        if (rep.neg_sz[a] == 0 || rep.neg_sz[b] == 0) continue;
+                        int i = rep.neg_list[a][(rval >> 5) % rep.neg_sz[a]];
+                        int j = rep.neg_list[b][(rval >> 15) % rep.neg_sz[b]];
+                        int64_t dE = st.eval_move2(i, j, a, b, -1);
+                        if (dE <= 0 || u01(rng) < std::exp(-(double)dE * invT)) {
+                            st.apply_move2(i, j, a, b, -1);
+                            rep.remove_neg(a, i); rep.add_neg(b, i);
+                            rep.remove_neg(b, j); rep.add_neg(a, j);
+                        } else continue;
+                    }
+                } else {
+                    int a = (int)(rval & 3ULL);
+                    if (rep.pos_sz[a] == 0 || rep.neg_sz[a] == 0) continue;
+                    int b = (a + 1 + (int)((rval >> 2) % 3ULL)) & 3;
+                    int fb = (int)((rval >> 4) & 1ULL);
+                    int i = rep.pos_list[a][(rval >> 5) % rep.pos_sz[a]];
+                    int j = rep.neg_list[a][(rval >> 15) % rep.neg_sz[a]];
+                    int64_t dE = st.eval_move3(i, j, a, b, fb);
+                    if (dE <= 0 || u01(rng) < std::exp(-(double)dE * invT)) {
+                        st.apply_move3(i, j, a, b, fb);
+                        rep.remove_pos(a, i);
+                        rep.remove_neg(a, j);
+                        if (!fb) {
+                            rep.add_pos(b, i);
+                            rep.add_neg(b, j);
+                        } else {
+                            rep.add_neg(b, i);
+                            rep.add_pos(b, j);
+                        }
+                    } else continue;
+                }
+
+                if (st.E < g_best_E.load(std::memory_order_relaxed)) {
+                    double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                    report_best(st, out_path, "pt", tid, el, total_steps);
+                    if (st.E == 0) return;
+                }
+                if (st.E > 0 && st.E <= polish_thresh && (total_steps - rep.last_polish_step) >= 80000ULL) {
+                    rep.last_polish_step = total_steps;
+                    State pol = st;
+                    if (polish_2move(pol, 24) && pol.E < g_best_E.load(std::memory_order_relaxed)) {
+                        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                        report_best(pol, out_path, "pt-2m", tid, el, total_steps);
+                        if (pol.E == 0) return;
+                    }
+                }
+            }
+        }
+
+        // Metropolis replica exchange on alternating parity pairs
+        int parity = (int)(sweep & 1ULL);
+        for (int slot = parity; slot + 1 < R; slot += 2) {
+            int r1 = order[slot];
+            int r2 = order[slot + 1];
+            double delta = (double)(reps[r1].st.E - reps[r2].st.E) * (1.0 / temps[slot] - 1.0 / temps[slot + 1]);
+            if (delta >= 0.0 || u01(rng) < std::exp(delta)) {
+                std::swap(order[slot], order[slot + 1]);
+            }
         }
     }
 }
 
 int main(int argc, char** argv) try {
     if (argc < 9) {
-        std::cerr << "Usage: ./tmatrix_solver <t> <g> <m1> <m2> <m3> <m4> <secs> <out_json> [threads=1] [mode=sa|tabu|hybrid]\n";
+        std::cerr << "Usage: ./tmatrix_solver <t> <g> <m1> <m2> <m3> <m4> <secs> <out_json> [threads=1] [mode=sa|tabu|pt|hybrid]\n";
         return 1;
     }
     int t = std::stoi(argv[1]);
@@ -795,8 +1236,8 @@ int main(int argc, char** argv) try {
         return 1;
     }
     if (!std::isfinite(secs) || secs <= 0 || threads <= 0 ||
-        (mode != "sa" && mode != "tabu" && mode != "hybrid")) {
-        std::cerr << "Expected positive secs and threads, and mode sa, tabu, or hybrid\n";
+        (mode != "sa" && mode != "tabu" && mode != "pt" && mode != "hybrid")) {
+        std::cerr << "Expected positive secs and threads, and mode sa, tabu, pt, or hybrid\n";
         return 1;
     }
     Instance inst = build_instance(t, g, m1, m2, m3, m4);
@@ -819,7 +1260,9 @@ int main(int argc, char** argv) try {
 
     std::vector<std::thread> pool;
     for (int tid = 0; tid < threads; ++tid) {
-        if (mode == "tabu" || (mode == "hybrid" && tid % 2 == 1))
+        if (mode == "pt" || (mode == "hybrid" && tid % 2 == 0))
+            pool.emplace_back(worker_pt, tid, &inst, secs, out_path);
+        else if (mode == "tabu" || (mode == "hybrid" && tid % 2 == 1))
             pool.emplace_back(worker_tabu, tid, &inst, secs, out_path);
         else
             pool.emplace_back(worker_sa, tid, &inst, secs, out_path);
