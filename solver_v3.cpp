@@ -8,6 +8,7 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -2220,6 +2221,274 @@ void worker_rrt(int tid, const OrbitProblem& prob, double max_seconds, double w_
     }
 }
 
+struct MitmOptions {
+    uint32_t pool = 128;
+    int64_t flat_max = INT64_MAX;
+    std::string inject;
+};
+
+struct MitmRow {
+    std::vector<int> signs;
+    std::vector<int> paf;
+    std::vector<uint64_t> fingerprints;
+};
+
+struct MitmPair {
+    uint64_t fingerprint;
+    uint32_t left, right;
+    int rotation;
+};
+
+// The multiplicative quotient by <U,-1> permutes the nonzero PAF shifts.
+static std::vector<int> cyclic_shifts(const OrbitProblem& prob, int& generator) {
+    int m = prob.m;
+    if (prob.b != 0 || m < 3 || m % 2 == 0) return {};
+    for (int d = 3; d <= m / d; d += 2) {
+        if (m % d == 0) return {};
+    }
+    std::vector<bool> in_shift_stabilizer(m);
+    for (int u : prob.U) {
+        in_shift_stabilizer[u] = in_shift_stabilizer[m - u] = true;
+    }
+    for (generator = 1; generator < m; ++generator) {
+        std::vector<int> shifts;
+        int x = 1;
+        do {
+            shifts.push_back(x);
+            x = (int)(1LL * x * generator % m);
+        } while (!in_shift_stabilizer[x]);
+        if (shifts.size() == (size_t)prob.K) return shifts;
+    }
+    return {};
+}
+
+static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, double seconds,
+                         const std::string& out_path, uint64_t seed) {
+    auto start = std::chrono::steady_clock::now();
+    auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); };
+    int generator;
+    const auto shifts = cyclic_shifts(prob, generator);
+    if (shifts.empty()) {
+        std::cerr << "MITM requires odd prime m and b=0.\n";
+        return 1;
+    }
+    const int K = prob.K;
+    constexpr uint64_t max_table_entries = 5000000;
+    if (!(seconds > 0.0) || !std::isfinite(seconds) || options.flat_max < 0) {
+        std::cerr << "MITM requires finite positive seconds and a nonnegative flatness cutoff.\n";
+        return 1;
+    }
+    if (options.pool == 0 || options.pool > max_table_entries / K / options.pool) {
+        std::cerr << "MITM requires a nonempty pool with K * pool^2 at most "
+                  << max_table_entries << ".\n";
+        return 1;
+    }
+
+    std::mt19937_64 rng(seed);
+    std::mt19937_64 fingerprint_rng(0x24c9bdb9c329ab77ULL);
+    std::vector<uint64_t> coefficients(K);
+    for (auto& coefficient : coefficients) coefficient = fingerprint_rng();
+    std::vector<int> powers(K, 1);
+    for (int k = 1; k < K; ++k) powers[k] = (int)(1LL * powers[k - 1] * generator % prob.m);
+
+    std::vector<int> orbit_reps;
+    for (const auto& orbit : prob.orbits) orbit_reps.push_back(orbit.front());
+    auto rotate_signs = [&](const std::vector<int>& signs, int k) {
+        std::vector<int> rotated;
+        rotated.reserve(prob.r);
+        for (int x : orbit_reps) {
+            rotated.push_back(signs[prob.elem_to_orb[1LL * x * powers[k] % prob.m]]);
+        }
+        return rotated;
+    };
+
+    std::vector<MitmRow> pools[4];
+    std::set<std::vector<int>> seen[4];
+    uint64_t attempts[4] = {};
+    auto add_row = [&](int s, const std::vector<int>& signs, bool injected) {
+        std::vector<int> seq(prob.m);
+        for (int x = 0; x < prob.m; ++x) seq[x] = signs[prob.elem_to_orb[x]];
+        if (std::accumulate(seq.begin(), seq.end(), 0) != prob.target_s[s]) return false;
+        std::vector<int> paf;
+        int64_t flat = 0;
+        for (int shift : shifts) {
+            int value = 0;
+            for (int x = 0; x < prob.m; ++x) value += seq[x] * seq[(x + shift) % prob.m];
+            paf.push_back(value);
+            flat += (int64_t)value * value;
+        }
+        if (!injected && flat > options.flat_max) return false;
+
+        // Keep one row for each PAF vector up to multiplicative rotation.
+        // Reversal has the same PAF, so this also removes reversal duplicates.
+        int canonical = 0;
+        for (int k = 1; k < K; ++k) {
+            for (int j = 0; j < K; ++j) {
+                int left = paf[(k + j) % K], right = paf[(canonical + j) % K];
+                if (left == right) continue;
+                if (left < right) canonical = k;
+                break;
+            }
+        }
+        std::rotate(paf.begin(), paf.begin() + canonical, paf.end());
+        if (!seen[s].insert(paf).second) return false;
+
+        std::vector<uint64_t> fingerprints(K);
+        for (int k = 0; k < K; ++k) {
+            for (int j = 0; j < K; ++j) {
+                fingerprints[k] += coefficients[j] * (uint64_t)paf[(k + j) % K];
+            }
+        }
+        pools[s].push_back({rotate_signs(signs, canonical), std::move(paf), std::move(fingerprints)});
+        return true;
+    };
+
+    if (!options.inject.empty()) {
+        std::ifstream input(options.inject);
+        for (int s = 0; s < 4; ++s) {
+            std::string text;
+            input >> text;
+            if ((int)text.size() != prob.r || text.find_first_not_of("+-") != std::string::npos) {
+                std::cerr << "MITM injection requires one orbit sign string per row.\n";
+                return 1;
+            }
+            std::vector<int> signs;
+            for (char sign : text) signs.push_back(sign == '+' ? 1 : -1);
+            if (!add_row(s, signs, true)) {
+                std::cerr << "MITM injected row has the wrong row sum.\n";
+                return 1;
+            }
+        }
+        std::string extra;
+        if (input >> extra) {
+            std::cerr << "MITM injection requires exactly four rows.\n";
+            return 1;
+        }
+    }
+
+    SearchState st(prob);
+    bool progress;
+    do {
+        progress = false;
+        for (int s = 0; s < 4 && elapsed() < seconds; ++s) {
+            if (pools[s].size() == options.pool || attempts[s] >= 32ULL * options.pool) continue;
+            ++attempts[s];
+            progress = true;
+            if (!prob.full_dp.sample(prob.target_s[s], st.seq[s], rng)) {
+                std::cerr << "MITM could not sample the requested row sum.\n";
+                return 1;
+            }
+            st.flat_seed_single(s, rng);
+            add_row(s, st.seq[s], false);
+        }
+    } while (progress);
+
+    std::cout << "MITM generation: generator=" << generator
+              << ", injected=" << !options.inject.empty() << ", flat_max=" << options.flat_max
+              << ", seconds=" << elapsed() << std::endl;
+    for (int s = 0; s < 4; ++s) {
+        int64_t min_flat = INT64_MAX, max_flat = 0;
+        for (const auto& row : pools[s]) {
+            int64_t flat = std::inner_product(row.paf.begin(), row.paf.end(), row.paf.begin(), int64_t{0});
+            min_flat = std::min(min_flat, flat);
+            max_flat = std::max(max_flat, flat);
+        }
+        std::cout << "MITM row " << s << ": count=" << pools[s].size() << ", attempts=" << attempts[s];
+        if (!pools[s].empty()) std::cout << ", flatness=[" << min_flat << "," << max_flat << "]";
+        std::cout << std::endl;
+    }
+    for (const auto& pool : pools) {
+        if (pool.empty()) return 2;
+    }
+
+    double match_start = elapsed();
+    if (match_start >= seconds) {
+        std::cout << "MITM time limit reached during generation.\n";
+        return 2;
+    }
+    std::vector<MitmPair> table;
+    table.reserve(pools[0].size() * pools[1].size() * K);
+    for (uint32_t a = 0; a < pools[0].size() && elapsed() < seconds; ++a) {
+        for (uint32_t b = 0; b < pools[1].size(); ++b) {
+            for (int k = 0; k < K; ++k) {
+                table.push_back({pools[0][a].fingerprints[0] + pools[1][b].fingerprints[k], a, b, k});
+            }
+        }
+    }
+    if (elapsed() >= seconds) {
+        std::cout << "MITM time limit reached during table construction.\n";
+        return 2;
+    }
+    std::sort(table.begin(), table.end(), [](const MitmPair& a, const MitmPair& b) {
+        return a.fingerprint < b.fingerprint;
+    });
+    // Fingerprint prefixes index the sorted table, leaving only a small range
+    // for binary search. Equal fingerprints always share a bucket.
+    constexpr unsigned prefix_bits = 16;
+    constexpr size_t bucket_count = size_t{1} << prefix_bits;
+    std::vector<size_t> buckets(bucket_count + 1);
+    size_t entry = 0;
+    for (size_t bucket = 0; bucket < bucket_count; ++bucket) {
+        buckets[bucket] = entry;
+        while (entry < table.size() && table[entry].fingerprint >> (64 - prefix_bits) == bucket) ++entry;
+    }
+    buckets.back() = table.size();
+    double build_seconds = elapsed() - match_start;
+    uint64_t probes = 0;
+    auto report = [&] {
+        std::cout << "MITM matching: entries=" << table.size()
+                  << ", table_bytes=" << table.capacity() * sizeof(MitmPair)
+                  << ", build_seconds=" << build_seconds << ", probes=" << probes
+                  << ", probe_seconds=" << elapsed() - match_start - build_seconds << std::endl;
+    };
+
+    // Fix the first row's rotation. Enumerate all three relative rotations of
+    // the other rows so this symmetry reduction preserves every possible match.
+    for (const auto& c : pools[2]) {
+        for (const auto& d : pools[3]) {
+            if (elapsed() >= seconds) {
+                report();
+                return 2;
+            }
+            for (int kc = 0; kc < K; ++kc) {
+                for (int kd = 0; kd < K; ++kd) {
+                    ++probes;
+                    uint64_t key = 0 - (c.fingerprints[kc] + d.fingerprints[kd]);
+                    size_t bucket = key >> (64 - prefix_bits);
+                    auto end = table.begin() + buckets[bucket + 1];
+                    auto it = std::lower_bound(table.begin() + buckets[bucket], end, key,
+                        [](const MitmPair& pair, uint64_t value) { return pair.fingerprint < value; });
+                    for (; it != end && it->fingerprint == key; ++it) {
+                        const auto& a = pools[0][it->left];
+                        const auto& b = pools[1][it->right];
+                        bool exact = true;
+                        for (int j = 0; j < K; ++j) {
+                            if (a.paf[j] + b.paf[(it->rotation + j) % K] +
+                                c.paf[(kc + j) % K] + d.paf[(kd + j) % K] != 0) {
+                                exact = false;
+                                break;
+                            }
+                        }
+                        if (!exact) continue;
+                        st.seq[0] = a.signs;
+                        st.seq[1] = rotate_signs(b.signs, it->rotation);
+                        st.seq[2] = rotate_signs(c.signs, kc);
+                        st.seq[3] = rotate_signs(d.signs, kd);
+                        st.recompute();
+                        record_if_best(0, "MITM", prob, st, start, out_path);
+                        if (g_found.load(std::memory_order_relaxed)) {
+                            report();
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    report();
+    return 2;
+}
+
 static std::vector<int> parse_int_list(const std::string& s) {
     std::vector<int> res;
     size_t p = 0;
@@ -2238,8 +2507,9 @@ int main(int argc, char** argv) {
                   << " <m> <g|g1,g2,...> <b> <seconds> <out.json> [threads=2] [s0 s1 s2 s3]"
                   << " [--gens=g1,g2,...] [--ts=s0,s1,s2,s3] [--w_row=64] [--w_alt=16]"
                   << " [--lock_row=0|1] [--flat_init=0|1] [--w_flat=0.0] [--sa_thi=220] [--sa_tlo=10]"
-                  << " [--target_alt=a0,a1,a2,a3] [--mode=hybrid|ils|pt|sa|rrt] [--gls=1|0]"
-                  << " [--save_best=<path>] [--two_opt_thresh=2000] [--seed=<uint64>] [--rrt_stage_steps=800000]\n";
+                  << " [--target_alt=a0,a1,a2,a3] [--mode=hybrid|ils|pt|sa|rrt|mitm] [--gls=1|0]"
+                  << " [--save_best=<path>] [--two_opt_thresh=2000] [--seed=<uint64>] [--rrt_stage_steps=800000]"
+                  << " [--mitm_pool=128] [--mitm_flat_max=<energy>] [--mitm_inject=<signs.txt>]\n";
         return 1;
     }
     int m = std::stoi(argv[1]);
@@ -2262,6 +2532,7 @@ int main(int argc, char** argv) {
     bool use_gls = true;
     uint64_t base_seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
     uint64_t rrt_stage_steps = 800000;
+    MitmOptions mitm;
 
     std::vector<std::string> pos;
     for (int i = 6; i < argc; ++i) {
@@ -2299,6 +2570,12 @@ int main(int argc, char** argv) {
             base_seed = std::stoull(a.substr(7));
         } else if (a.rfind("--rrt_stage_steps=", 0) == 0) {
             rrt_stage_steps = std::stoull(a.substr(18));
+        } else if (a.rfind("--mitm_pool=", 0) == 0) {
+            mitm.pool = std::stoi(a.substr(12));
+        } else if (a.rfind("--mitm_flat_max=", 0) == 0) {
+            mitm.flat_max = std::stoll(a.substr(16));
+        } else if (a.rfind("--mitm_inject=", 0) == 0) {
+            mitm.inject = a.substr(14);
         } else if (a.rfind("--mode=", 0) == 0) {
             mode = a.substr(7);
         } else if (a.rfind("--gls=", 0) == 0) {
@@ -2347,7 +2624,7 @@ int main(int argc, char** argv) {
 #else
     std::cout << ", simd=scalar";
 #endif
-    std::cout << ", threads=" << threads << ", seed=" << base_seed;
+    std::cout << ", threads=" << (mode == "mitm" ? 1 : threads) << ", seed=" << base_seed;
     if (mode == "rrt") std::cout << ", rrt_stage_steps=" << rrt_stage_steps;
     std::cout << std::endl;
 
@@ -2355,6 +2632,8 @@ int main(int argc, char** argv) {
         std::cout << "INFEASIBLE (pre-check): " << prob.infeasible_reason << std::endl;
         return 3;
     }
+
+    if (mode == "mitm") return run_flat_mitm(prob, mitm, secs, out_path, base_seed);
 
     std::vector<std::thread> pool;
     for (int t = 0; t < threads; ++t) {
