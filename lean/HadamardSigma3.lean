@@ -1,4 +1,5 @@
 import Mathlib.Algebra.BigOperators.Fin
+import Mathlib.Algebra.Group.Equiv.Basic
 import Mathlib.Algebra.Order.BigOperators.Group.Finset
 import Mathlib.Tactic.Linarith
 import Mathlib.Tactic.Ring
@@ -201,5 +202,115 @@ theorem card_eq_one {S : Type*} [Fintype S] (x y : Fin 4 → S → ℤ)
     Fintype.card S = 1 := by
   have h := order_eq_28 x y _ hx hy hshift hquot hrow
   omega
+
+
+section FullAutocorrelation
+
+variable {S : Type*} [Fintype S] [AddGroup S]
+
+/-- Periodic cross-correlation on the second factor of the split group. -/
+private def corr (x y : S → ℤ) (u : S) : ℤ := ∑ z, x z * y (z + u)
+
+private lemma sum_corr (x y : S → ℤ) :
+    (∑ u, corr x y u) = (∑ z, x z) * (∑ z, y z) := by
+  unfold corr
+  rw [Finset.sum_comm, Finset.sum_mul]
+  apply Finset.sum_congr rfl
+  intro z _
+  rw [← Finset.mul_sum]
+  congr 1
+  simpa using Equiv.sum_comp (Equiv.addLeft z) y
+
+/-- Combined autocorrelation at shift `(0, u)` for the split rows. -/
+def zeroCosetPAF (x y : Fin 4 → S → ℤ) (u : S) : ℤ :=
+  ∑ i, (corr (x i) (x i) u + 3 * corr (y i) (y i) u)
+
+/-- Combined autocorrelation at shift `(c, u)`, for a nonzero `c` in
+`(ℤ/2ℤ)²`. Addition by `c` swaps the zero and `c` cosets, and swaps the
+two remaining cosets. -/
+def nonzeroCosetPAF (x y : Fin 4 → S → ℤ) (u : S) : ℤ :=
+  ∑ i, (corr (x i) (y i) u + corr (y i) (x i) u + 2 * corr (y i) (y i) u)
+
+/-- The required autocorrelations of the split width-12 family force
+`|S| = 1`, and hence the construction has order 28. -/
+theorem card_eq_one_of_paf (x y : Fin 4 → S → ℤ)
+    (hx : ∀ i z, x i z = 1 ∨ x i z = -1)
+    (hy : ∀ i z, y i z = 1 ∨ y i z = -1)
+    (hzero : ∀ u, u ≠ 0 → zeroCosetPAF x y u = -12)
+    (hnonzero : ∀ u, nonzeroCosetPAF x y u = 4) :
+    Fintype.card S = 1 := by
+  classical
+  let s : ℤ := Fintype.card S
+  have hP0 : zeroCosetPAF x y 0 = 16 * s := by
+    have hself (i : Fin 4) (z : S) : x i z * x i z = 1 ∧ y i z * y i z = 1 := by
+      constructor
+      · rcases hx i z with h | h <;> norm_num [h]
+      · rcases hy i z with h | h <;> norm_num [h]
+    have hxself (i : Fin 4) : corr (x i) (x i) 0 = s := by
+      simp [corr, fun z => (hself i z).1, s]
+    have hyself (i : Fin 4) : corr (y i) (y i) 0 = s := by
+      simp [corr, fun z => (hself i z).2, s]
+    simp only [zeroCosetPAF, hxself, hyself, Finset.sum_const, Finset.card_univ,
+      Fintype.card_fin, nsmul_eq_mul]
+    ring
+  have hshift : ∑ i, (∑ z, (2 + 2 * x i z * y i z)) = 4 := by
+    rw [← hnonzero 0, nonzeroCosetPAF]
+    apply Finset.sum_congr rfl
+    intro i _
+    simp only [corr, add_zero, Finset.mul_sum, ← Finset.sum_add_distrib]
+    apply Finset.sum_congr rfl
+    intro z _
+    rcases hx i z with h | h <;> rcases hy i z with h' | h' <;> norm_num [h, h']
+  have hsum0 : ∑ u, zeroCosetPAF x y u = 4 * s + 12 := by
+    rw [← Finset.sum_erase_add _ _ (Finset.mem_univ (0 : S)), hP0]
+    have hc : ((Finset.univ.erase (0 : S)).card : ℤ) = s - 1 := by
+      rw [Finset.card_erase_of_mem (Finset.mem_univ _), Finset.card_univ]
+      have hnonempty : 0 < Fintype.card S := Fintype.card_pos_iff.mpr ⟨(0 : S)⟩
+      omega
+    rw [show (∑ u ∈ Finset.univ.erase (0 : S), zeroCosetPAF x y u) =
+        ∑ _u ∈ Finset.univ.erase (0 : S), (-12 : ℤ) from
+      Finset.sum_congr rfl (fun u hu => hzero u (Finset.mem_erase.mp hu).1)]
+    simp only [Finset.sum_const, nsmul_eq_mul, hc]
+    ring
+  have hsum1 : ∑ u, nonzeroCosetPAF x y u = 4 * s := by
+    simp only [hnonzero, Finset.sum_const, Finset.card_univ, nsmul_eq_mul, s]
+    ring
+  let a (i : Fin 4) : ℤ := ∑ z, x i z
+  let b (i : Fin 4) : ℤ := ∑ z, y i z
+  have ha : ∑ i, (a i * a i + 3 * (b i * b i)) = 4 * s + 12 := by
+    rw [← hsum0]
+    unfold zeroCosetPAF
+    rw [Finset.sum_comm]
+    apply Finset.sum_congr rfl
+    intro i _
+    simp only [Finset.sum_add_distrib, ← Finset.mul_sum, sum_corr, a, b]
+  have hb : ∑ i, (a i * b i + b i * a i + 2 * (b i * b i)) = 4 * s := by
+    rw [← hsum1]
+    unfold nonzeroCosetPAF
+    rw [Finset.sum_comm]
+    apply Finset.sum_congr rfl
+    intro i _
+    simp only [Finset.sum_add_distrib, ← Finset.mul_sum, sum_corr, a, b]
+  have hquot : ∑ i, (a i - b i) ^ 2 = 12 := by
+    calc
+      _ = (∑ i, (a i * a i + 3 * (b i * b i))) -
+          ∑ i, (a i * b i + b i * a i + 2 * (b i * b i)) := by
+        rw [← Finset.sum_sub_distrib]
+        apply Finset.sum_congr rfl
+        intro i _
+        ring
+      _ = 12 := by rw [ha, hb]; ring
+  have hrow : ∑ i, (a i + 3 * b i) ^ 2 = 16 * s + 12 := by
+    calc
+      _ = (∑ i, (a i * a i + 3 * (b i * b i))) +
+          3 * ∑ i, (a i * b i + b i * a i + 2 * (b i * b i)) := by
+        rw [Finset.mul_sum, ← Finset.sum_add_distrib]
+        apply Finset.sum_congr rfl
+        intro i _
+        ring
+      _ = _ := by rw [ha, hb]; ring
+  exact card_eq_one x y hx hy hshift hquot hrow
+
+end FullAutocorrelation
 
 end HadamardSigma3
