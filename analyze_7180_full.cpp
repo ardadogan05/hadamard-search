@@ -26,8 +26,15 @@ static constexpr int TARGET_PAF = -92;    // -4*(1794/78)
 
 static constexpr int WEIGHTS[10] = {1, 6, 6, 3, 6, 3, 6, 3, 2, 3};
 
-struct Bitset155 {
-    uint64_t w[3] = {0, 0, 0};
+static constexpr int TARGET_Q26 = 850;    // (7088 + 2*(-92) - 8*13) / 8
+static constexpr int TARGET_M6  = 745;    // (7088 + 12*(-92) - 8*3) / 8
+
+template <int MAX_VAL>
+struct Bitset {
+    static constexpr int NW = (MAX_VAL + 64) / 64;
+    static constexpr uint64_t TOP_MASK =
+        ((MAX_VAL + 1) % 64 == 0) ? ~0ULL : ((1ULL << ((MAX_VAL + 1) % 64)) - 1ULL);
+    uint64_t w[NW] = {};
 
     inline void set(int bit) {
         w[bit >> 6] |= (1ULL << (bit & 63));
@@ -36,46 +43,45 @@ struct Bitset155 {
         return (w[bit >> 6] >> (bit & 63)) & 1ULL;
     }
     inline bool any() const {
-        return (w[0] | w[1] | w[2]) != 0;
+        uint64_t acc = 0;
+        for (int i = 0; i < NW; ++i) acc |= w[i];
+        return acc != 0;
     }
-    inline void or_with(const Bitset155& o) {
-        w[0] |= o.w[0];
-        w[1] |= o.w[1];
-        w[2] |= o.w[2];
+    inline void or_with(const Bitset& o) {
+        for (int i = 0; i < NW; ++i) w[i] |= o.w[i];
     }
     inline int min_bit() const {
-        if (w[0]) return __builtin_ctzll(w[0]);
-        if (w[1]) return 64 + __builtin_ctzll(w[1]);
-        if (w[2]) return 128 + __builtin_ctzll(w[2]);
-        return 999;
+        for (int i = 0; i < NW; ++i) {
+            if (w[i]) return (i << 6) + __builtin_ctzll(w[i]);
+        }
+        return MAX_VAL + 1;
     }
-    inline void or_shl(const Bitset155& src, int s) {
-        if (s == 0) {
-            or_with(src);
-        } else if (s < 64) {
-            w[0] |= (src.w[0] << s);
-            w[1] |= (src.w[1] << s) | (src.w[0] >> (64 - s));
-            w[2] |= (src.w[2] << s) | (src.w[1] >> (64 - s));
-        } else if (s < 128) {
-            int k = s - 64;
-            if (k == 0) {
-                w[1] |= src.w[0];
-                w[2] |= src.w[1];
-            } else {
-                w[1] |= (src.w[0] << k);
-                w[2] |= (src.w[1] << k) | (src.w[0] >> (64 - k));
+    inline void or_shl(const Bitset& src, int s) {
+        int word_shift = s >> 6;
+        int bit_shift = s & 63;
+        if (bit_shift == 0) {
+            for (int i = word_shift; i < NW; ++i) {
+                w[i] |= src.w[i - word_shift];
             }
         } else {
-            int k = s - 128;
-            w[2] |= (src.w[0] << k);
+            int rshift = 64 - bit_shift;
+            w[word_shift] |= (src.w[0] << bit_shift);
+            for (int i = word_shift + 1; i < NW; ++i) {
+                w[i] |= (src.w[i - word_shift] << bit_shift) | (src.w[i - word_shift - 1] >> rshift);
+            }
         }
-        w[2] &= ((1ULL << 27) - 1ULL);
+        w[NW - 1] &= TOP_MASK;
     }
 };
 
-static inline Bitset155 convolve(const Bitset155& a, const Bitset155& b) {
-    Bitset155 res;
-    for (int word = 0; word < 3; ++word) {
+using Bitset155 = Bitset<SCALED_E>;
+using Bitset851 = Bitset<TARGET_Q26>;
+using Bitset746 = Bitset<TARGET_M6>;
+
+template <int MAX_VAL>
+static inline Bitset<MAX_VAL> convolve(const Bitset<MAX_VAL>& a, const Bitset<MAX_VAL>& b) {
+    Bitset<MAX_VAL> res;
+    for (int word = 0; word < Bitset<MAX_VAL>::NW; ++word) {
         uint64_t x = a.w[word];
         while (x) {
             int bit = (word << 6) + __builtin_ctzll(x);
@@ -86,16 +92,21 @@ static inline Bitset155 convolve(const Bitset155& a, const Bitset155& b) {
     return res;
 }
 
-static inline bool sum_hits_154(const Bitset155& a, const Bitset155& b) {
-    for (int word = 0; word < 3; ++word) {
+template <int MAX_VAL>
+static inline bool sum_hits_target(const Bitset<MAX_VAL>& a, const Bitset<MAX_VAL>& b) {
+    for (int word = 0; word < Bitset<MAX_VAL>::NW; ++word) {
         uint64_t x = a.w[word];
         while (x) {
             int bit = (word << 6) + __builtin_ctzll(x);
-            if (b.test(SCALED_E - bit)) return true;
+            if (b.test(MAX_VAL - bit)) return true;
             x &= x - 1;
         }
     }
     return false;
+}
+
+static inline bool sum_hits_154(const Bitset155& a, const Bitset155& b) {
+    return sum_hits_target<SCALED_E>(a, b);
 }
 
 struct HalfVec {
@@ -119,6 +130,8 @@ struct ProfileKey {
 struct ProfileData {
     ProfileKey key;
     Bitset155 emask;
+    Bitset851 qmask;
+    Bitset746 mmask;
     vector<HalfVec> vecs; // sorted by E
     int E_offset[SCALED_E + 2];
     vector<int32_t> uniq_even[5][SCALED_E + 1];
@@ -132,7 +145,11 @@ struct Row46 {
     int32_t p0, p1;
     int pe_id, po_id;
     Bitset155 emask;
+    Bitset851 qmask;
+    Bitset746 mmask;
     int min_E;
+    int min_q;
+    int min_m;
     bool is_mod46_witness_row = false;
 };
 
@@ -140,7 +157,11 @@ struct BGroup {
     int32_t p0, p1;
     int64_t key;
     Bitset155 emask;
+    Bitset851 qmask;
+    Bitset746 mmask;
     int min_E;
+    int min_q;
+    int min_m;
     vector<int> row_ids;
 };
 
@@ -645,8 +666,89 @@ static KillReason check_witness_all11(
     }
 }
 
+static bool check_witness_even26_exact(
+    const vector<ProfileData>& profiles,
+    const int pid[8],
+    Scratch& sc
+) {
+    Bitset155 pref[9], suff[9];
+    pref[0].set(0);
+    for (int i = 0; i < 8; ++i) pref[i + 1] = convolve(pref[i], profiles[pid[i]].emask);
+    suff[8].set(0);
+    for (int i = 7; i >= 0; --i) suff[i] = convolve(suff[i + 1], profiles[pid[i]].emask);
+
+    int allowed_E[8][160];
+    int allowed_cnt[8];
+    int min_E[8];
+    for (int i = 0; i < 8; ++i) {
+        Bitset155 others = convolve(pref[i], suff[i + 1]);
+        const Bitset155& em = profiles[pid[i]].emask;
+        int cnt = 0;
+        for (int word = 0; word < 3; ++word) {
+            uint64_t x = em.w[word];
+            while (x) {
+                int bit = (word << 6) + __builtin_ctzll(x);
+                if (others.test(SCALED_E - bit)) allowed_E[i][cnt++] = bit;
+                x &= x - 1;
+            }
+        }
+        if (cnt == 0) return false;
+        allowed_cnt[i] = cnt;
+        min_E[i] = allowed_E[i][0];
+    }
+
+    int32_t sum_lo = 0, sum_hi = 0;
+    for (int i = 0; i < 8; ++i) {
+        const auto& pd = profiles[pid[i]];
+        int32_t lo = 1e9, hi = -1e9;
+        for (int j = 0; j < allowed_cnt[i]; ++j) {
+            int e = allowed_E[i][j];
+            if (pd.min_even[0][e] < lo) lo = pd.min_even[0][e];
+            if (pd.max_even[0][e] > hi) hi = pd.max_even[0][e];
+        }
+        sum_lo += lo;
+        sum_hi += hi;
+    }
+    if (TARGET_PAF < sum_lo || TARGET_PAF > sum_hi) return false;
+
+    int min_EL = min_E[0] + min_E[1] + min_E[2] + min_E[3];
+    int min_ER = min_E[4] + min_E[5] + min_E[6] + min_E[7];
+    int max_EL = SCALED_E - min_ER;
+    int max_ER = SCALED_E - min_EL;
+    int max_p[4] = {
+        max_EL - min_E[2] - min_E[3],
+        max_EL - min_E[0] - min_E[1],
+        max_ER - min_E[6] - min_E[7],
+        max_ER - min_E[4] - min_E[5]
+    };
+    for (int pair_i = 0; pair_i < 4; ++pair_i) {
+        int a = 2 * pair_i, b = 2 * pair_i + 1;
+        auto& out = sc.p[pair_i];
+        out.clear();
+        const auto& pa = profiles[pid[a]].uniq_even[0];
+        const auto& pb = profiles[pid[b]].uniq_even[0];
+        int lim = max_p[pair_i];
+        for (int ia = 0; ia < allowed_cnt[a]; ++ia) {
+            int ea = allowed_E[a][ia];
+            for (int ib = 0; ib < allowed_cnt[b]; ++ib) {
+                int eb = allowed_E[b][ib];
+                if (ea + eb > lim) break;
+                for (int32_t va : pa[ea])
+                    for (int32_t vb : pb[eb])
+                        out.push_back({ea + eb, va + vb});
+            }
+        }
+        sort(out.begin(), out.end());
+        out.erase(unique(out.begin(), out.end()), out.end());
+        if (out.empty()) return false;
+    }
+    return check_2x2_ep(sc.p[0], sc.p[1], sc.p[2], sc.p[3], max_EL, max_ER, sc.left_v);
+}
+
 int main(int argc, char** argv) {
     bool energy_only = false;
+    bool prefilter_only = false;
+    bool exact_even26 = false;
     string data_path = "/tmp/data_7180.txt";
     string out_path = "/tmp/survivors_7180.txt";
     int start_quad = 0;
@@ -655,6 +757,8 @@ int main(int argc, char** argv) {
     uint64_t per_quad_cap = 0;
     for (int i = 1; i < argc; ++i) {
         if (string(argv[i]) == "--energy-only") energy_only = true;
+        else if (string(argv[i]) == "--prefilter-only") prefilter_only = true;
+        else if (string(argv[i]) == "--exact-even26") exact_even26 = true;
         else if (string(argv[i]) == "--data" && i + 1 < argc) data_path = argv[++i];
         else if (string(argv[i]) == "--out" && i + 1 < argc) out_path = argv[++i];
         else if (string(argv[i]) == "--start-quad" && i + 1 < argc) start_quad = atoi(argv[++i]);
@@ -662,6 +766,7 @@ int main(int argc, char** argv) {
         else if (string(argv[i]) == "--witness-cap" && i + 1 < argc) witness_cap = strtoull(argv[++i], nullptr, 10);
         else if (string(argv[i]) == "--per-quad-cap" && i + 1 < argc) per_quad_cap = strtoull(argv[++i], nullptr, 10);
     }
+    bool need_vecs = !energy_only;
 
     auto t_start = chrono::steady_clock::now();
     build_shift_matrices();
@@ -750,7 +855,7 @@ int main(int argc, char** argv) {
                     int E = 11 * a + b;
                     if (E > SCALED_E) continue;
                     pd.emask.set(E);
-                    if (!energy_only) {
+                    if (need_vecs) {
                         RawVec item;
                         for (int i = 0; i < 10; ++i) {
                             int s_i = 2 * ((bm >> i) & 1) - 1;
@@ -763,7 +868,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        if (!energy_only) {
+        if (need_vecs) {
             sort(raw.begin(), raw.end());
             raw.erase(unique(raw.begin(), raw.end()), raw.end());
             pd.vecs.resize(raw.size());
@@ -771,6 +876,17 @@ int main(int argc, char** argv) {
                 memcpy(pd.vecs[i].v, raw[i].v, 10);
                 pd.vecs[i].E = raw[i].E;
                 for (int k = 0; k < 5; ++k) pd.vecs[i].even_paf[k] = eval_even(pd.vecs[i].v, k);
+                int E_half = 39 + 44 * (int)pd.vecs[i].E;
+                int Q = E_half + 2 * pd.vecs[i].even_paf[0];
+                int M = E_half + 6 * pd.vecs[i].even_paf[1] + 6 * pd.vecs[i].even_paf[2];
+                if (Q < 13 || ((Q - 13) & 7) != 0 || M < 3 || ((M - 3) & 7) != 0) {
+                    fprintf(stderr, "INTERNAL ERROR: invalid Q=%d or M=%d\n", Q, M);
+                    exit(1);
+                }
+                int q = (Q - 13) >> 3;
+                int m = (M - 3) >> 3;
+                if (q <= TARGET_Q26) pd.qmask.set(q);
+                if (m <= TARGET_M6) pd.mmask.set(m);
             }
             int idx = 0;
             for (int e = 0; e <= SCALED_E; ++e) {
@@ -811,6 +927,15 @@ int main(int argc, char** argv) {
                 auto& r = rows_by_a[a][r_id];
                 r.emask = convolve(profiles[r.pe_id].emask, profiles[r.po_id].emask);
                 r.min_E = r.emask.min_bit();
+                if (need_vecs) {
+                    r.qmask = convolve(profiles[r.pe_id].qmask, profiles[r.po_id].qmask);
+                    r.mmask = convolve(profiles[r.pe_id].mmask, profiles[r.po_id].mmask);
+                    r.min_q = r.qmask.min_bit();
+                    r.min_m = r.mmask.min_bit();
+                } else {
+                    r.min_q = 0;
+                    r.min_m = 0;
+                }
                 auto pk = make_pair(r.p0, r.p1);
                 auto it = gmap.find(pk);
                 if (it == gmap.end()) {
@@ -820,13 +945,23 @@ int main(int argc, char** argv) {
                     g.p0 = r.p0; g.p1 = r.p1;
                     g.key = (int64_t)r.p0 * 100000LL + r.p1;
                     g.emask = r.emask;
+                    g.qmask = r.qmask;
+                    g.mmask = r.mmask;
                     g.min_E = r.min_E;
+                    g.min_q = r.min_q;
+                    g.min_m = r.min_m;
                     g.row_ids.push_back(r_id);
                     groups[a].push_back(move(g));
                 } else {
                     auto& g = groups[a][it->second];
                     g.emask.or_with(r.emask);
                     if (r.min_E < g.min_E) g.min_E = r.min_E;
+                    if (need_vecs) {
+                        g.qmask.or_with(r.qmask);
+                        g.mmask.or_with(r.mmask);
+                        if (r.min_q < g.min_q) g.min_q = r.min_q;
+                        if (r.min_m < g.min_m) g.min_m = r.min_m;
+                    }
                     g.row_ids.push_back(r_id);
                 }
             }
@@ -846,11 +981,14 @@ int main(int argc, char** argv) {
            chrono::duration<double>(t_prep - t_start).count());
     fflush(stdout);
 
-    FILE* survivor_out = energy_only ? nullptr : fopen(out_path.c_str(), "w");
+    FILE* survivor_out = (energy_only || prefilter_only) ? nullptr : fopen(out_path.c_str(), "w");
 
     uint64_t counts[NUM_REASONS] = {};
     uint64_t total_mod46 = 0;
     uint64_t total_energy_ok = 0;
+    uint64_t total_q26_ok = 0;
+    uint64_t total_m6_ok = 0;
+    uint64_t total_exact_even26_ok = 0;
     int end_q = (max_quads > 0) ? min(n_quads, start_quad + max_quads) : n_quads;
     Scratch sc;
 
@@ -858,7 +996,7 @@ int main(int argc, char** argv) {
     int quads_exhausted = 0;
     int quads_capped = 0;
     for (int qi = start_quad; qi < end_q && !hit_cap; ++qi) {
-        uint64_t quad_energy_ok = 0;
+        uint64_t quad_survivors = 0;
         bool quad_capped = false;
         int i1 = quads[qi][0], i2 = quads[qi][1], i3 = quads[qi][2], i4 = quads[qi][3];
         const auto& G1 = g2[i1];
@@ -877,7 +1015,13 @@ int main(int argc, char** argv) {
         int maxL = N_ORD - min_p0_3 - min_p0_4;
         int maxR = N_ORD - min_p0_1 - min_p0_2;
 
-        struct PairItem { int idx1, idx2; Bitset155 emask; };
+        struct PairItem {
+            int idx1, idx2;
+            Bitset155 emask;
+            Bitset851 qmask;
+            Bitset746 mmask;
+            int min_q, min_m;
+        };
         unordered_map<int64_t, vector<PairItem>> left_map;
         left_map.reserve(G1.size() * G2.size() / 2 + 16);
 
@@ -886,7 +1030,20 @@ int main(int argc, char** argv) {
             for (int b = 0; b < (int)G2.size(); ++b) {
                 if (G1[a].p0 + G2[b].p0 > maxL) break;
                 int64_t k = G1[a].key + G2[b].key;
-                left_map[k].push_back({a, b, convolve(G1[a].emask, G2[b].emask)});
+                PairItem pi;
+                pi.idx1 = a;
+                pi.idx2 = b;
+                pi.emask = convolve(G1[a].emask, G2[b].emask);
+                if (need_vecs) {
+                    pi.min_q = G1[a].min_q + G2[b].min_q;
+                    pi.min_m = G1[a].min_m + G2[b].min_m;
+                    pi.qmask = convolve(G1[a].qmask, G2[b].qmask);
+                    pi.mmask = convolve(G1[a].mmask, G2[b].mmask);
+                } else {
+                    pi.min_q = 0;
+                    pi.min_m = 0;
+                }
+                left_map[k].push_back(move(pi));
             }
         }
         if (left_map.empty()) { quads_exhausted++; continue; }
@@ -899,6 +1056,15 @@ int main(int argc, char** argv) {
                 auto it = left_map.find(target_key - G3[c].key - G4[d].key);
                 if (it == left_map.end()) continue;
                 Bitset155 em_cd = convolve(G3[c].emask, G4[d].emask);
+                Bitset851 qm_cd;
+                Bitset746 mm_cd;
+                int min_q_cd = 0, min_m_cd = 0;
+                if (need_vecs) {
+                    min_q_cd = G3[c].min_q + G4[d].min_q;
+                    min_m_cd = G3[c].min_m + G4[d].min_m;
+                    qm_cd = convolve(G3[c].qmask, G4[d].qmask);
+                    mm_cd = convolve(G3[c].mmask, G4[d].mmask);
+                }
 
                 for (const auto& pi : it->second) {
                     const auto& list1 = G1[pi.idx1].row_ids;
@@ -906,64 +1072,150 @@ int main(int argc, char** argv) {
                     const auto& list3 = G3[c].row_ids;
                     const auto& list4 = G4[d].row_ids;
 
-                    bool group_can_hit = sum_hits_154(pi.emask, em_cd);
-                    if (!group_can_hit) {
+                    auto count_group = [&]() -> uint64_t {
                         if (i2 != i3 && i3 != i4) {
-                            uint64_t cnt = (uint64_t)list1.size() * list2.size() * list3.size() * list4.size();
-                            total_mod46 += cnt;
-                            counts[KILL_ENERGY] += cnt;
-                        } else {
-                            for (int r2 : list2)
-                                for (int r3 : list3) {
-                                    if (i2 == i3 && r2 > r3) continue;
-                                    for (int r4 : list4) {
-                                        if (i3 == i4 && r3 > r4) continue;
-                                        total_mod46 += list1.size();
-                                        counts[KILL_ENERGY] += list1.size();
-                                    }
-                                }
+                            return (uint64_t)list1.size() * list2.size() * list3.size() * list4.size();
                         }
+                        uint64_t cnt = 0;
+                        for (int r2 : list2)
+                            for (int r3 : list3) {
+                                if (i2 == i3 && r2 > r3) continue;
+                                for (int r4 : list4) {
+                                    if (i3 == i4 && r3 > r4) continue;
+                                    cnt += list1.size();
+                                }
+                            }
+                        return cnt;
+                    };
+
+                    if (!sum_hits_154(pi.emask, em_cd)) {
+                        uint64_t cnt = count_group();
+                        total_mod46 += cnt;
+                        counts[KILL_ENERGY] += cnt;
                         continue;
                     }
+                    if (need_vecs && !prefilter_only) {
+                        if (pi.min_q + min_q_cd > TARGET_Q26 || !sum_hits_target<TARGET_Q26>(pi.qmask, qm_cd)) {
+                            uint64_t cnt = count_group();
+                            total_mod46 += cnt;
+                            counts[KILL_EVEN_26] += cnt;
+                            continue;
+                        }
+                        if (pi.min_m + min_m_cd > TARGET_M6 || !sum_hits_target<TARGET_M6>(pi.mmask, mm_cd)) {
+                            uint64_t cnt = count_group();
+                            total_mod46 += cnt;
+                            counts[KILL_JOINT_EVEN] += cnt;
+                            continue;
+                        }
+                    }
 
-                    vector<tuple<int, int, Bitset155>> pairs34;
+                    struct Pair34 {
+                        int r3, r4;
+                        Bitset155 em34;
+                        Bitset851 qm34;
+                        Bitset746 mm34;
+                        int min_q34, min_m34;
+                    };
+                    vector<Pair34> pairs34;
+                    pairs34.reserve(list3.size() * list4.size());
                     for (int r3 : list3) {
                         for (int r4 : list4) {
                             if (i3 == i4 && r3 > r4) continue;
-                            pairs34.push_back({r3, r4, convolve(R3[r3].emask, R4[r4].emask)});
+                            Pair34 p34;
+                            p34.r3 = r3;
+                            p34.r4 = r4;
+                            p34.em34 = convolve(R3[r3].emask, R4[r4].emask);
+                            if (need_vecs) {
+                                p34.min_q34 = R3[r3].min_q + R4[r4].min_q;
+                                p34.min_m34 = R3[r3].min_m + R4[r4].min_m;
+                                p34.qm34 = convolve(R3[r3].qmask, R4[r4].qmask);
+                                p34.mm34 = convolve(R3[r3].mmask, R4[r4].mmask);
+                            } else {
+                                p34.min_q34 = 0;
+                                p34.min_m34 = 0;
+                            }
+                            pairs34.push_back(move(p34));
                         }
                     }
 
                     for (int r1 : list1) {
                         for (int r2 : list2) {
                             Bitset155 em12 = convolve(R1[r1].emask, R2[r2].emask);
-                            for (const auto& [r3, r4, em34] : pairs34) {
+                            int min_q12 = R1[r1].min_q + R2[r2].min_q;
+                            int min_m12 = R1[r1].min_m + R2[r2].min_m;
+                            bool have_qm12 = false, have_mm12 = false;
+                            Bitset851 qm12;
+                            Bitset746 mm12;
+                            for (const auto& p34 : pairs34) {
+                                int r3 = p34.r3, r4 = p34.r4;
                                 if (i2 == i3 && r2 > r3) continue;
                                 total_mod46++;
-                                if (!sum_hits_154(em12, em34)) {
+                                if (!sum_hits_154(em12, p34.em34)) {
                                     counts[KILL_ENERGY]++;
                                     continue;
                                 }
                                 total_energy_ok++;
-                                quad_energy_ok++;
-                                if (!energy_only) {
-                                    int pid[8] = {
-                                        R1[r1].pe_id, R1[r1].po_id,
-                                        R2[r2].pe_id, R2[r2].po_id,
-                                        R3[r3].pe_id, R3[r3].po_id,
-                                        R4[r4].pe_id, R4[r4].po_id
-                                    };
-                                    const Row46* rptrs[4] = {&R1[r1], &R2[r2], &R3[r3], &R4[r4]};
-                                    KillReason kr = check_witness_all11(profiles, pid, survivor_out, rptrs, sc);
-                                    counts[kr]++;
-                                    if (witness_cap > 0 && total_energy_ok >= witness_cap) {
-                                        hit_cap = true;
-                                        break;
+                                if (energy_only) continue;
+
+                                // Fast additive mod-26 energy check (qmask: E + 2*paf_26 == 6904)
+                                if (min_q12 + p34.min_q34 > TARGET_Q26) {
+                                    counts[KILL_EVEN_26]++;
+                                    continue;
+                                }
+                                if (!have_qm12) {
+                                    qm12 = convolve(R1[r1].qmask, R2[r2].qmask);
+                                    have_qm12 = true;
+                                }
+                                if (!sum_hits_target<TARGET_Q26>(qm12, p34.qm34)) {
+                                    counts[KILL_EVEN_26]++;
+                                    continue;
+                                }
+                                total_q26_ok++;
+
+                                // Fast additive mod-6 energy check (mmask: E + 6*paf_6 + 6*paf_12 == 5984)
+                                if (min_m12 + p34.min_m34 > TARGET_M6) {
+                                    counts[KILL_JOINT_EVEN]++;
+                                    continue;
+                                }
+                                if (!have_mm12) {
+                                    mm12 = convolve(R1[r1].mmask, R2[r2].mmask);
+                                    have_mm12 = true;
+                                }
+                                if (!sum_hits_target<TARGET_M6>(mm12, p34.mm34)) {
+                                    counts[KILL_JOINT_EVEN]++;
+                                    continue;
+                                }
+                                total_m6_ok++;
+
+                                int pid[8] = {
+                                    R1[r1].pe_id, R1[r1].po_id,
+                                    R2[r2].pe_id, R2[r2].po_id,
+                                    R3[r3].pe_id, R3[r3].po_id,
+                                    R4[r4].pe_id, R4[r4].po_id
+                                };
+
+                                if (prefilter_only) {
+                                    if (exact_even26) {
+                                        if (check_witness_even26_exact(profiles, pid, sc)) {
+                                            total_exact_even26_ok++;
+                                        } else {
+                                            counts[KILL_EVEN_26]++;
+                                        }
                                     }
-                                    if (per_quad_cap > 0 && quad_energy_ok >= per_quad_cap) {
-                                        quad_capped = true;
-                                        break;
-                                    }
+                                    continue;
+                                }
+
+                                quad_survivors++;
+                                const Row46* rptrs[4] = {&R1[r1], &R2[r2], &R3[r3], &R4[r4]};
+                                KillReason kr = check_witness_all11(profiles, pid, survivor_out, rptrs, sc);
+                                counts[kr]++;
+                                if (witness_cap > 0 && total_m6_ok >= witness_cap) {
+                                    hit_cap = true;
+                                    break;
+                                }
+                                if (per_quad_cap > 0 && quad_survivors >= per_quad_cap) {
+                                    quad_capped = true;
+                                    break;
                                 }
                             }
                             if (hit_cap || quad_capped) break;
@@ -986,6 +1238,13 @@ int main(int argc, char** argv) {
            chrono::duration<double>(t_end - t_start).count());
     printf("  Total canonical mod-46 witnesses : %llu\n", (unsigned long long)total_mod46);
     printf("  Survived mod-78 energy (7088)    : %llu\n", (unsigned long long)total_energy_ok);
+    if (need_vecs) {
+        printf("  Survived mod-26 energy (q=850)   : %llu\n", (unsigned long long)total_q26_ok);
+        printf("  Survived mod-6  energy (m=745)   : %llu\n", (unsigned long long)total_m6_ok);
+        if (prefilter_only && exact_even26) {
+            printf("  Survived exact (E=7088,p26=-92)  : %llu\n", (unsigned long long)total_exact_even26_ok);
+        }
+    }
     for (int k = 0; k < NUM_REASONS; ++k) {
         if (counts[k] > 0 || k == SURVIVED_ALL11 || k == INCONCLUSIVE_CAPPED) {
             printf("  %-22s : %llu\n", REASON_NAMES[k], (unsigned long long)counts[k]);
