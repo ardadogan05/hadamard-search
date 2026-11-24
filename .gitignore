@@ -9,3 +9,4 @@ lean/.lake/
 test_*.json
 tmatrix_solver
 tmatrix_mitm
+tmatrix_2adic
