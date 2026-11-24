@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 Exact-Integer Scanner for Theorem 7 (b = 12, k = 4, v = (n - 12)/4 = 4s)
 across all 85 live open Hadamard orders <= 10,000 (UNKNOWN_85).
 
@@ -22,6 +22,26 @@ Exact Fourier / compression consequences (100% integer arithmetic):
        4*(2*D(d) - v) <= +4   for d in G \ S.
   4. Prime/field q-compression on S (for every odd prime q | s, or F_{p^a}^+):
        sum_f |f_hat(chi)|^2 = n  for every chi with chi|_S != 1!
+
+An order restriction applies before any subgroup enumeration. For the split family
+G = Z_2^2 x S with sigma_3 fixing S pointwise and cycling the three nonzero
+Z_2^2 coordinates, write each sequence as (x, y, y, y), with x and y signed
+vectors on S. At any shift (c, 0), c != 0, addition by c exchanges the zero
+coset with the c coset, and exchanges the two remaining cosets. Thus
+P_f(c, 0) = 2s + 2<x, y> = 4e_f, where e_f counts positions with x = y.
+The required combined PAF is +4, so exactly one e_f is 1 and the others are 0.
+Writing a_f = sum x, b_f = sum y, this means q_f = a_f + b_f is +/-2 in
+that one sequence and zero in the others.
+
+The quotient condition in (2) gives sum_f (a_f - b_f)^2 = 12. The differences
+d_f = a_f - b_f are even because a_f and b_f both have parity s, so their
+absolute values are 0, 2, 2, 2. In each of the three rows with q_f = 0,
+d_f = -2b_f. If s is even, all three differences are multiples of 4 and
+must vanish, contradicting the unique zero. If s is odd, all three have
+absolute value 2, so the exceptional row has d_f = 0. The row sum is
+2q_f - d_f, so (1) gives n = 16 + 3*4 = 28. This includes the s = 1
+example checked by verify_thm7.py. No other order is possible in this
+split sigma_3 family, regardless of the multiplier action on S.
 """
 
 import math
@@ -43,6 +63,9 @@ from scan_expanded import (
 )
 
 
+SPLIT_SIGMA3_ORDER = 28
+
+
 def divisors(n):
     fac = factor(n)
     ds = [1]
@@ -60,6 +83,8 @@ def check_thm7_sigma3_row_and_coset(n, s, orb_sizes_S):
       - {|d_f|} = {0, 2, 2, 2}  (i.e. one f has d_f = 0, three have d_f in {-2, +2}).
     Since flipping f negates (s_f, d_f), we can fix s_f >= 0 (keeping both signs of d_f when s_f > 0).
     Returns list of valid quadruples of (s_f, d_f) sorted."""
+    if n != SPLIT_SIGMA3_ORDER:
+        return []
     R_S = set(reachable_sums(orb_sizes_S))
     lim = math.isqrt(n)
 
@@ -220,6 +245,10 @@ def main():
             eligible.append((n, v, s))
 
     print(f"=== THEOREM 7 (b=12, k=4, v=4s) ELIGIBLE OPEN ORDERS: {len(eligible)} / 85 ===", flush=True)
+    eligible = [(n, v, s) for n, v, s in eligible if n == SPLIT_SIGMA3_ORDER]
+    print(f"{len(eligible)} orders satisfy the split sigma_3 condition n = {SPLIT_SIGMA3_ORDER}.", flush=True)
+    if not eligible:
+        return
 
     print("\n" + "=" * 90)
     print("PART A: G = Z_2^2 x Z_s with U = <sigma_3> x U_S (r = 2 * r_S <= 46)")
