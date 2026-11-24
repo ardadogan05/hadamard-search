@@ -776,6 +776,121 @@ struct SearchState {
         }
     }
 
+    // Single-row Tabu flatness optimizer minimizing sum_k PAF_s(d_k)^2 (preserves rsum[s]).
+    void flat_tabu_single(int s, std::mt19937_64& rng, int steps, int tabu_len = 8) {
+        if (prob->size_groups.empty() || steps <= 0) return;
+        std::vector<int> Ps(Kpad, 0);
+        std::vector<int> gs((size_t)r * Kpad, 0);
+        for (int k = 0; k < K; ++k) {
+            int64_t pk = prob->diag_const[k];
+            int64_t acc = 0;
+            for (int i = 0; i < r; ++i) {
+                int64_t gval = 0;
+                const int* rowM = &prob->MT[((size_t)i * r) * Kpad];
+                for (int j = 0; j < r; ++j) {
+                    gval += (int64_t)rowM[(size_t)j * Kpad + k] * seq[s][j];
+                }
+                gs[(size_t)i * Kpad + k] = (int)gval;
+                acc += (int64_t)seq[s][i] * gval;
+            }
+            pk += acc / 2;
+            Ps[k] = (int)pk;
+        }
+        int64_t cur_flat = 0;
+        for (int k = 0; k < K; ++k) cur_flat += (int64_t)Ps[k] * Ps[k];
+        int64_t best_flat = cur_flat;
+        std::vector<int> best_seq = seq[s];
+        std::vector<int> tabu(r, 0);
+        std::vector<int> pos, neg;
+        pos.reserve(r);
+        neg.reserve(r);
+
+        for (int step = 1; step <= steps; ++step) {
+            int best_i = -1, best_j = -1;
+            int64_t best_d = INT64_MAX;
+            int n_ties = 0;
+            const int* __restrict__ pptr = Ps.data();
+            for (const auto& grp : prob->size_groups) {
+                pos.clear();
+                neg.clear();
+                for (int idx : grp) {
+                    if (seq[s][idx] > 0) pos.push_back(idx);
+                    else neg.push_back(idx);
+                }
+                for (int i : pos) {
+                    const int* __restrict__ gi = &gs[(size_t)i * Kpad];
+                    bool ti = (tabu[i] > step);
+                    for (int j : neg) {
+                        bool is_tabu = ti || (tabu[j] > step);
+                        const int* __restrict__ gj = &gs[(size_t)j * Kpad];
+                        const int* __restrict__ mij = &prob->MT[((size_t)i * r + j) * Kpad];
+                        int64_t d = 0;
+#ifdef __AVX2__
+                        __m256i acc = _mm256_setzero_si256();
+                        for (int k = 0; k < Kpad; k += 8) {
+                            __m256i vgi = _mm256_loadu_si256((const __m256i*)(gi + k));
+                            __m256i vgj = _mm256_loadu_si256((const __m256i*)(gj + k));
+                            __m256i vmij = _mm256_loadu_si256((const __m256i*)(mij + k));
+                            __m256i vp = _mm256_loadu_si256((const __m256i*)(pptr + k));
+                            __m256i vdp = _mm256_sub_epi32(_mm256_slli_epi32(_mm256_sub_epi32(vgj, vgi), 1),
+                                                           _mm256_slli_epi32(vmij, 2));
+                            __m256i vsum = _mm256_add_epi32(_mm256_slli_epi32(vp, 1), vdp);
+                            __m256i ev = _mm256_mul_epi32(vdp, vsum);
+                            __m256i od = _mm256_mul_epi32(_mm256_srli_epi64(vdp, 32), _mm256_srli_epi64(vsum, 32));
+                            acc = _mm256_add_epi64(acc, _mm256_add_epi64(ev, od));
+                        }
+                        d = hsum_epi64(acc);
+#else
+                        for (int k = 0; k < Kpad; ++k) {
+                            int64_t dp = 2LL * (gj[k] - gi[k]) - 4LL * mij[k];
+                            d += dp * (2LL * pptr[k] + dp);
+                        }
+#endif
+                        if (is_tabu && cur_flat + d >= best_flat) continue;
+                        if (d < best_d) {
+                            best_d = d; best_i = i; best_j = j; n_ties = 1;
+                        } else if (d == best_d && best_i != -1 && (int)(rng() % (++n_ties)) == 0) {
+                            best_i = i; best_j = j;
+                        }
+                    }
+                }
+            }
+            if (best_i == -1) break;
+            seq[s][best_i] = -1;
+            seq[s][best_j] = 1;
+            cur_flat += best_d;
+            tabu[best_i] = step + tabu_len + (int)(rng() % 5);
+            tabu[best_j] = step + tabu_len + (int)(rng() % 5);
+            {
+                const int* gi = &gs[(size_t)best_i * Kpad];
+                for (int k = 0; k < Kpad; ++k) Ps[k] -= 2 * gi[k];
+                const int* mbase = &prob->MT[((size_t)best_i * r) * Kpad];
+                for (int u = 0; u < r; ++u) {
+                    if (u == best_i) continue;
+                    int* gu = &gs[(size_t)u * Kpad];
+                    const int* miu = &mbase[(size_t)u * Kpad];
+                    for (int k = 0; k < Kpad; ++k) gu[k] -= 2 * miu[k];
+                }
+            }
+            {
+                const int* gj = &gs[(size_t)best_j * Kpad];
+                for (int k = 0; k < Kpad; ++k) Ps[k] += 2 * gj[k];
+                const int* mbase = &prob->MT[((size_t)best_j * r) * Kpad];
+                for (int u = 0; u < r; ++u) {
+                    if (u == best_j) continue;
+                    int* gu = &gs[(size_t)u * Kpad];
+                    const int* mju = &mbase[(size_t)u * Kpad];
+                    for (int k = 0; k < Kpad; ++k) gu[k] += 2 * mju[k];
+                }
+            }
+            if (cur_flat < best_flat) {
+                best_flat = cur_flat;
+                best_seq = seq[s];
+            }
+        }
+        seq[s] = std::move(best_seq);
+    }
+
     void resample_single_seq(int s, std::mt19937_64& rng) {
         if (prob->full_dp.built) {
             prob->full_dp.sample(prob->target_s[s], seq[s], rng);
@@ -2224,6 +2339,8 @@ void worker_rrt(int tid, const OrbitProblem& prob, double max_seconds, double w_
 struct MitmOptions {
     uint32_t pool = 128;
     int64_t flat_max = INT64_MAX;
+    int64_t pair_flat_max = INT64_MAX;
+    int tabu_steps = 0;
     std::string inject;
 };
 
@@ -2235,9 +2352,42 @@ struct MitmRow {
 
 struct MitmPair {
     uint64_t fingerprint;
-    uint32_t left, right;
-    int left_rotation, right_rotation;
+    uint32_t left_packed;   // lower 24 bits: row index, upper 8 bits: rotation
+    uint32_t right_packed;  // lower 24 bits: row index, upper 8 bits: rotation
+
+    static MitmPair make(uint64_t fp, uint32_t l, uint32_t r, int lr, int rr) {
+        return {fp, (l & 0xFFFFFFu) | ((uint32_t)(lr & 0xFF) << 24),
+                (r & 0xFFFFFFu) | ((uint32_t)(rr & 0xFF) << 24)};
+    }
+    uint32_t left() const { return left_packed & 0xFFFFFFu; }
+    uint32_t right() const { return right_packed & 0xFFFFFFu; }
+    int left_rotation() const { return (int)(left_packed >> 24); }
+    int right_rotation() const { return (int)(right_packed >> 24); }
 };
+static_assert(sizeof(MitmPair) == 16, "MitmPair should stay 16 bytes");
+
+static inline int64_t pair_flatness_sum(const int* __restrict__ a, const int* __restrict__ b, int K) {
+    int64_t sum = 0;
+    int k = 0;
+#ifdef __AVX2__
+    __m256i acc = _mm256_setzero_si256();
+    for (; k + 8 <= K; k += 8) {
+        __m256i va = _mm256_loadu_si256((const __m256i*)(a + k));
+        __m256i vb = _mm256_loadu_si256((const __m256i*)(b + k));
+        __m256i vs = _mm256_add_epi32(va, vb);
+        __m256i ev = _mm256_mul_epi32(vs, vs);
+        __m256i od_s = _mm256_srli_epi64(vs, 32);
+        __m256i od = _mm256_mul_epi32(od_s, od_s);
+        acc = _mm256_add_epi64(acc, _mm256_add_epi64(ev, od));
+    }
+    sum = hsum_epi64(acc);
+#endif
+    for (; k < K; ++k) {
+        int64_t s = (int64_t)a[k] + b[k];
+        sum += s * s;
+    }
+    return sum;
+}
 
 // The multiplicative quotient by <U,-1> permutes the nonzero PAF shifts.
 static std::vector<int> cyclic_shifts(const OrbitProblem& prob, int& generator) {
@@ -2273,14 +2423,19 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
         return 1;
     }
     const int K = prob.K;
-    constexpr uint64_t max_table_entries = 5000000;
-    if (!(seconds > 0.0) || !std::isfinite(seconds) || options.flat_max < 0) {
-        std::cerr << "MITM requires finite positive seconds and a nonnegative flatness cutoff.\n";
+    constexpr uint64_t max_table_entries = 20000000;
+    if (!(seconds > 0.0) || !std::isfinite(seconds) || options.flat_max < 0 ||
+        options.pair_flat_max < 0 || options.tabu_steps < 0) {
+        std::cerr << "MITM requires finite positive seconds and nonnegative flatness cutoffs/tabu steps.\n";
         return 1;
     }
-    if (options.pool == 0 || options.pool > max_table_entries / K / options.pool) {
-        std::cerr << "MITM requires a nonempty pool with K * pool^2 at most "
-                  << max_table_entries << ".\n";
+    if (K > 255 || options.pool == 0 || options.pool > (1u << 24)) {
+        std::cerr << "MITM requires K <= 255 and 1 <= pool <= 2^24.\n";
+        return 1;
+    }
+    if (options.pair_flat_max == INT64_MAX && options.pool > max_table_entries / K / options.pool) {
+        std::cerr << "MITM requires K * pool^2 <= " << max_table_entries
+                  << " unless --mitm_pair_flat_max is set.\n";
         return 1;
     }
 
@@ -2325,6 +2480,7 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
         for (int x = 0; x < prob.m; ++x) seq[x] = signs[prob.elem_to_orb[x]];
         if (std::accumulate(seq.begin(), seq.end(), 0) != prob.target_s[s]) return false;
         std::vector<int> paf;
+        paf.reserve(3 * K);
         int64_t flat = 0;
         for (int shift : shifts) {
             int value = 0;
@@ -2398,23 +2554,35 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
                 std::cerr << "MITM could not sample the requested row sum.\n";
                 return 1;
             }
-            st.flat_seed_single(s, rng);
+            if (options.tabu_steps > 0) st.flat_tabu_single(s, rng, options.tabu_steps);
+            else st.flat_seed_single(s, rng);
             add_row(s, st.seq[s], false);
         }
     } while (progress);
 
+    double gen_seconds = elapsed();
+    uint64_t total_rows = pools[0].size() + pools[1].size() + pools[2].size() + pools[3].size();
     std::cout << "MITM generation: generator=" << generator
-              << ", injected=" << !options.inject.empty() << ", flat_max=" << options.flat_max
-              << ", seconds=" << elapsed() << std::endl;
+              << ", injected=" << !options.inject.empty()
+              << ", tabu_steps=" << options.tabu_steps
+              << ", flat_max=" << options.flat_max
+              << ", pair_flat_max=" << options.pair_flat_max
+              << ", seconds=" << gen_seconds
+              << ", rows_per_sec=" << (gen_seconds > 0 ? total_rows / gen_seconds : 0.0) << std::endl;
     for (int s = 0; s < 4; ++s) {
-        int64_t min_flat = INT64_MAX, max_flat = 0;
+        std::vector<int64_t> flats;
+        flats.reserve(pools[s].size());
         for (const auto& row : pools[s]) {
-            int64_t flat = std::inner_product(row.paf.begin(), row.paf.begin() + K, row.paf.begin(), int64_t{0});
-            min_flat = std::min(min_flat, flat);
-            max_flat = std::max(max_flat, flat);
+            flats.push_back(std::inner_product(row.paf.begin(), row.paf.begin() + K, row.paf.begin(), int64_t{0}));
         }
+        std::sort(flats.begin(), flats.end());
         std::cout << "MITM row " << s << ": count=" << pools[s].size() << ", attempts=" << attempts[s];
-        if (!pools[s].empty()) std::cout << ", flatness=[" << min_flat << "," << max_flat << "]";
+        if (!flats.empty()) {
+            double denom = (double)K * prob.m;
+            int64_t med = flats[flats.size() / 2];
+            std::cout << ", flatness=[" << flats.front() << "," << med << "," << flats.back() << "]"
+                      << ", Phi_f=[" << flats.front() / denom << "," << med / denom << "," << flats.back() / denom << "]";
+        }
         std::cout << std::endl;
     }
     for (const auto& pool : pools) {
@@ -2427,16 +2595,33 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
         return 2;
     }
     std::vector<MitmPair> table;
-    table.reserve(pools[0].size() * pools[1].size() * K);
-    for (uint32_t a = 0; a < pools[0].size() && elapsed() < seconds; ++a) {
+    uint64_t max_possible = (uint64_t)pools[0].size() * pools[1].size() * K;
+    const bool filter_pairs = (options.pair_flat_max < INT64_MAX);
+    uint64_t init_reserve = filter_pairs ? std::min<uint64_t>(max_possible, 1000000)
+                                         : std::min<uint64_t>(max_possible, max_table_entries);
+    table.reserve((size_t)init_reserve);
+    uint64_t build_scanned = 0;
+    bool table_capped = false;
+    for (uint32_t a = 0; a < pools[0].size() && elapsed() < seconds && !table_capped; ++a) {
+        const auto& left = pools[0][a];
+        const int* lpaf = left.paf.data();
         for (uint32_t b = 0; b < pools[1].size(); ++b) {
-            const auto& left = pools[0][a];
             const auto& right = pools[1][b];
+            const int* rpaf = right.paf.data();
             for (int relative = 0; relative < K; ++relative) {
+                ++build_scanned;
+                if (filter_pairs && pair_flatness_sum(lpaf, rpaf + relative, K) > options.pair_flat_max) {
+                    continue;
+                }
+                if (table.size() >= max_table_entries) {
+                    table_capped = true;
+                    break;
+                }
                 int kl = pair_anchor(left, right, relative, 1);
                 int kr = (kl + relative) % K;
-                table.push_back({left.fingerprints[kl] + right.fingerprints[kr], a, b, kl, kr});
+                table.push_back(MitmPair::make(left.fingerprints[kl] + right.fingerprints[kr], a, b, kl, kr));
             }
+            if (table_capped) break;
         }
     }
     if (elapsed() >= seconds) {
@@ -2446,9 +2631,9 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
     std::sort(table.begin(), table.end(), [](const MitmPair& a, const MitmPair& b) {
         return a.fingerprint < b.fingerprint;
     });
-    // Fingerprint prefixes index the sorted table, leaving only a small range
+    // Fingerprint prefixes index the sorted table, leaving only a tiny range
     // for binary search. Equal fingerprints always share a bucket.
-    constexpr unsigned prefix_bits = 16;
+    constexpr unsigned prefix_bits = 20;
     constexpr size_t bucket_count = size_t{1} << prefix_bits;
     std::vector<size_t> buckets(bucket_count + 1);
     size_t entry = 0;
@@ -2459,11 +2644,22 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
     buckets.back() = table.size();
     double build_seconds = elapsed() - match_start;
     uint64_t probes = 0;
+    uint64_t probe_scanned = 0;
     auto report = [&] {
-        std::cout << "MITM matching: entries=" << table.size()
+        double probe_seconds = elapsed() - match_start - build_seconds;
+        std::cout << "MITM matching: build_scanned=" << build_scanned
+                  << ", entries=" << table.size()
+                  << (table_capped ? " (CAPPED)" : "")
                   << ", table_bytes=" << table.capacity() * sizeof(MitmPair)
-                  << ", build_seconds=" << build_seconds << ", probes=" << probes
-                  << ", probe_seconds=" << elapsed() - match_start - build_seconds << std::endl;
+                  << ", build_seconds=" << build_seconds
+                  << ", probe_scanned=" << probe_scanned
+                  << ", probes=" << probes
+                  << ", probe_seconds=" << probe_seconds
+                  << ", scan_pairs_per_sec="
+                  << ((build_seconds + probe_seconds) > 0
+                          ? (build_scanned + probe_scanned) / (build_seconds + probe_seconds)
+                          : 0.0)
+                  << std::endl;
     };
 
     // Joint cyclic rotations act on both members of a pair. Canonicalize
@@ -2471,12 +2667,18 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
     // On the probing side canonicalize the negated sum, so complement
     // vectors yield the same canonical form even when tied at a minimum.
     for (const auto& c : pools[2]) {
+        const int* cpaf = c.paf.data();
         for (const auto& d : pools[3]) {
             if (elapsed() >= seconds) {
                 report();
                 return 2;
             }
+            const int* dpaf = d.paf.data();
             for (int relative = 0; relative < K; ++relative) {
+                ++probe_scanned;
+                if (filter_pairs && pair_flatness_sum(cpaf, dpaf + relative, K) > options.pair_flat_max) {
+                    continue;
+                }
                 ++probes;
                 int kc = pair_anchor(c, d, relative, -1);
                 int kd = (kc + relative) % K;
@@ -2486,9 +2688,9 @@ static int run_flat_mitm(const OrbitProblem& prob, const MitmOptions& options, d
                 auto it = std::lower_bound(table.begin() + buckets[bucket], end, key,
                     [](const MitmPair& pair, uint64_t value) { return pair.fingerprint < value; });
                 for (; it != end && it->fingerprint == key; ++it) {
-                    const auto& a = pools[0][it->left];
-                    const auto& b = pools[1][it->right];
-                    int ka = it->left_rotation, kb = it->right_rotation;
+                    const auto& a = pools[0][it->left()];
+                    const auto& b = pools[1][it->right()];
+                    int ka = it->left_rotation(), kb = it->right_rotation();
                     bool exact = true;
                     for (int j = 0; j < K; ++j) {
                         if (a.paf[ka + j] + b.paf[kb + j] + c.paf[kc + j] + d.paf[kd + j] != 0) {
@@ -2535,7 +2737,7 @@ int main(int argc, char** argv) {
                   << " [--lock_row=0|1] [--flat_init=0|1] [--w_flat=0.0] [--sa_thi=220] [--sa_tlo=10]"
                   << " [--target_alt=a0,a1,a2,a3] [--mode=hybrid|ils|pt|sa|rrt|mitm] [--gls=1|0]"
                   << " [--save_best=<path>] [--two_opt_thresh=2000] [--seed=<uint64>] [--rrt_stage_steps=800000]"
-                  << " [--mitm_pool=128] [--mitm_flat_max=<energy>] [--mitm_inject=<signs.txt>]\n";
+                  << " [--mitm_pool=128] [--mitm_flat_max=<energy>] [--mitm_pair_flat_max=<energy>] [--mitm_tabu_steps=0] [--mitm_inject=<signs.txt>]\n";
         return 1;
     }
     int m = std::stoi(argv[1]);
@@ -2600,6 +2802,10 @@ int main(int argc, char** argv) {
             mitm.pool = std::stoi(a.substr(12));
         } else if (a.rfind("--mitm_flat_max=", 0) == 0) {
             mitm.flat_max = std::stoll(a.substr(16));
+        } else if (a.rfind("--mitm_pair_flat_max=", 0) == 0) {
+            mitm.pair_flat_max = std::stoll(a.substr(21));
+        } else if (a.rfind("--mitm_tabu_steps=", 0) == 0) {
+            mitm.tabu_steps = std::stoi(a.substr(18));
         } else if (a.rfind("--mitm_inject=", 0) == 0) {
             mitm.inject = a.substr(14);
         } else if (a.rfind("--mode=", 0) == 0) {
