@@ -3,8 +3,8 @@
 Independent exact integer verifier for Hadamard matrices constructed from
 Legendre quadruples / Goethals-Seidel sequences (Theorem 5 of arXiv:2610.27175v1).
 
-Given a witness JSON file produced by solver.cpp / solver_v2.cpp:
-  1. Reconstructs the orbits under multiplication by g mod m and expands the
+Given a witness JSON file produced by a Goethals-Seidel solver:
+  1. Reconstructs the orbits of the multiplier group modulo m and expands the
      4 sequences A, B, C, D of length m.
   2. Independently verifies O(m^2) periodic autocorrelations:
          sum_{s=0}^3 PAF_s(d) == -b   for all 1 <= d < m.
@@ -20,22 +20,26 @@ Usage:
 """
 
 import json
+import math
 import sys
 import time
 
 
-def build_orbits(m: int, g: int):
+def build_orbits(m: int, g: int | list[int]):
+    generators = [g] if isinstance(g, int) else g
     elem_to_orb = [-1] * m
     orbits = []
     for x in range(m):
         if elem_to_orb[x] == -1:
             oid = len(orbits)
-            orb = []
-            cur = x
-            while elem_to_orb[cur] == -1:
-                elem_to_orb[cur] = oid
-                orb.append(cur)
-                cur = (cur * g) % m
+            orb = [x]
+            elem_to_orb[x] = oid
+            for residue in orb:
+                for generator in generators:
+                    y = residue * generator % m
+                    if elem_to_orb[y] == -1:
+                        elem_to_orb[y] = oid
+                        orb.append(y)
             orbits.append(orb)
     return orbits, elem_to_orb
 
@@ -281,28 +285,43 @@ def verify_hadamard_exact(H, expected_n: int, also_naive_threshold: int = 128):
     return True, f"EXACT PASS: {n}x{n} Hadamard matrix verified (all entries in {{-1,+1}}, H @ H.T == {n}*I)"
 
 
-def verify_witness_file(path: str):
-    t0 = time.perf_counter()
-    with open(path, "r") as f:
-        data = json.load(f)
-
-    n = int(data["n"])
-    m = int(data["m"])
-    g = int(data["g"])
-    b = int(data["b"])
-    orbit_signs = data["orbit_signs"]
+def expand_witness(data):
+    if not isinstance(data, dict):
+        raise ValueError("Witness must be a JSON object")
+    n, m, b = (data.get(key) for key in ("n", "m", "b"))
+    if any(type(value) is not int for value in (n, m, b)):
+        raise ValueError("n, m and b must be integers")
+    if m <= 0 or b not in (0, 4):
+        raise ValueError("Expected m > 0 and b equal to 0 or 4")
 
     if n != 4 * m + b:
-        print(f"FAIL: n={n} != 4*m+b={4*m+b}")
-        return False
+        raise ValueError(f"n={n} != 4*m+b={4*m+b}")
 
-    orbits, elem_to_orb = build_orbits(m, g)
+    generators = data.get("gens", [data.get("g")])
+    if not isinstance(generators, list) or any(
+        type(g) is not int or math.gcd(g, m) != 1 for g in generators
+    ):
+        raise ValueError("Each multiplier generator must be an integer coprime to m")
+    orbits, elem_to_orb = build_orbits(m, generators)
     r = len(orbits)
-    if len(orbit_signs) != 4 or any(len(s) != r for s in orbit_signs):
-        print(f"FAIL: orbit_signs shape mismatch (expected 4 x {r})")
-        return False
+    signs = data.get("orbit_signs")
+    if not isinstance(signs, list) or len(signs) != 4 or any(
+        not isinstance(row, list) or len(row) != r for row in signs
+    ):
+        raise ValueError(f"orbit_signs shape mismatch (expected 4 x {r})")
+    if any(type(sign) is not int or sign not in (-1, 1) for row in signs for sign in row):
+        raise ValueError("orbit_signs entries must be integers equal to -1 or 1")
+    return n, m, b, [[row[i] for i in elem_to_orb] for row in signs]
 
-    seqs = [[int(orbit_signs[s][elem_to_orb[x]]) for x in range(m)] for s in range(4)]
+
+def verify_witness_file(path: str):
+    t0 = time.perf_counter()
+    try:
+        with open(path, "r") as f:
+            n, m, b, seqs = expand_witness(json.load(f))
+    except (OSError, ValueError) as exc:
+        print(f"FAIL: {exc}")
+        return False
 
     ok_paf, msg_paf = verify_sequences_paf(seqs, b)
     print(f"[1/3] Sequence PAF check (m={m}, b={b}): {msg_paf}")
@@ -384,6 +403,26 @@ def run_self_test():
     ok, msg = verify_hadamard_exact(H20_bad, 20)
     assert not ok, "Corrupted matrix unexpectedly passed!"
     print(f"  [PASS] Negative test (flipped 1 entry in H20): correctly rejected ({msg})")
+
+    # Test 6: An unbordered solver_v3 witness uses both listed generators.
+    witness = {
+        "n": 12, "m": 3, "b": 0, "g": 1, "gens": [1, 2],
+        "orbit_signs": [[1, 1], [-1, 1], [-1, 1], [-1, 1]],
+    }
+    n, _, b, seqs = expand_witness(witness)
+    ok, msg = verify_sequences_paf(seqs, b)
+    assert ok, msg
+    ok, msg = verify_hadamard_exact(build_hadamard_theorem5(seqs, b), n)
+    assert ok, msg
+    print(f"  [PASS] Multi-generator witness: {msg}")
+
+    witness["orbit_signs"][0][0] = 1.5
+    try:
+        expand_witness(witness)
+    except ValueError:
+        print("  [PASS] Fractional orbit sign rejected")
+    else:
+        raise AssertionError("Fractional orbit sign unexpectedly passed")
 
     print("=== All self-tests PASSED ===")
 
