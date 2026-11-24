@@ -1,5 +1,5 @@
 // Fast C++20 Orbit-Space Circulant T-Matrix Solver (Tabu+GLS & Tight-Band Reheat SA)
-// Usage: ./tmatrix_solver <t> <g> <m1> <m2> <m3> <m4> <secs> <out_json> [threads=1] [mode=tabu|sa]
+// Usage: ./tmatrix_solver <t> <g> <m1> <m2> <m3> <m4> <secs> <out_json> [threads=1] [mode=sa|tabu|hybrid]
 //
 // Exact row-sum-preserving moves on the (r-1) uniform-size orbits (size = |U|):
 //   1. Same-matrix sign-swap: (i in a with +1, j in a with -1) -> swap signs
@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <mutex>
@@ -79,7 +80,7 @@ static Instance build_instance(int t, int g, int m1, int m2, int m3, int m4) {
     inst.K = (int)inst.d_reps.size();
     inst.K_pad = ((inst.K + 7) / 8) * 8;
 
-    inst.MT.assign(inst.r * inst.r * inst.K_pad, 0);
+    inst.MT.assign(static_cast<size_t>(inst.r) * inst.r * inst.K_pad, 0);
     inst.diag_sum.assign(inst.K_pad, 0);
     for (int k = 0; k < inst.K; ++k) {
         int d = inst.d_reps[k];
@@ -397,8 +398,9 @@ static void self_check_deltas(const Instance& inst) {
 static std::atomic<bool> g_found{false};
 static std::atomic<int64_t> g_best_E{1LL << 60};
 static std::mutex g_io_mtx;
+static bool g_witness_failed = false;
 
-static void save_witness(const std::string& path, const Instance& inst, const State& st) {
+static bool save_witness(const std::string& path, const Instance& inst, const State& st) {
     std::ofstream out(path);
     out << "{\n";
     out << "  \"t\": " << inst.t << ",\n";
@@ -412,6 +414,48 @@ static void save_witness(const std::string& path, const Instance& inst, const St
     for (int i = 0; i < inst.r; ++i) out << st.sgn[i] << (i + 1 < inst.r ? ", " : "");
     out << "]\n";
     out << "}\n";
+    out.close();
+    return static_cast<bool>(out);
+}
+
+// Check the expanded sequences directly before treating an incremental zero as a witness.
+static bool verify_zero(const State& st) {
+    const Instance& inst = *st.inst;
+    for (int d = 1; d < inst.t; ++d) {
+        int paf = 0;
+        for (int x = 0; x < inst.t; ++x) {
+            int i = inst.orb_id[x], j = inst.orb_id[(x + d) % inst.t];
+            if (st.mat[i] == st.mat[j]) paf += st.sgn[i] * st.sgn[j];
+        }
+        if (paf != 0) return false;
+    }
+    return true;
+}
+
+static void report_best(const State& st, const std::string& out_path, const char* mode,
+                        int tid, double elapsed, uint64_t step) {
+    int64_t prev = g_best_E.load(std::memory_order_relaxed);
+    if (st.E > 0 && st.E >= prev) return;
+    std::lock_guard<std::mutex> lock(g_io_mtx);
+    if (g_found.load(std::memory_order_relaxed) || st.E >= g_best_E.load(std::memory_order_relaxed)) return;
+    if (st.E == 0 && !verify_zero(st)) {
+        std::cerr << "Incremental E=0 failed the all-shift autocorrelation check\n";
+        g_witness_failed = true;
+        g_found.store(true, std::memory_order_relaxed);
+        return;
+    }
+    g_best_E.store(st.E, std::memory_order_relaxed);
+    std::cout << "[" << mode << "-T" << tid << " " << elapsed << "s step=" << step
+              << "] new best E=" << st.E << std::endl;
+    if (st.E == 0) {
+        g_witness_failed = !save_witness(out_path, *st.inst, st);
+        if (g_witness_failed)
+            std::cerr << "Could not write T-matrix witness to " << out_path << "\n";
+        else
+            std::cout << "Verified zero autocorrelation for every nonzero shift. Witness saved to "
+                      << out_path << std::endl;
+        g_found.store(true, std::memory_order_relaxed);
+    }
 }
 
 struct BestMove {
@@ -431,6 +475,8 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
     std::vector<int> W(inst->K, 1);
 
     int64_t local_best = st.E;
+    report_best(st, out_path, "tabu", tid, 0, 0);
+    bool weighted = false;
     int iter = 0;
     int stall = 0;
     int tenure = std::max(5, inst->r / 4);
@@ -467,8 +513,8 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
         for (int a = 0; a < 4; ++a) {
             for (int i : pos[a]) {
                 for (int j : neg[a]) {
-                    int64_t dW = st.eval_move1(i, j, a, W.data());
-                    int64_t dE = (stall == 0) ? dW : st.eval_move1(i, j, a, nullptr);
+                    int64_t dW = st.eval_move1(i, j, a, weighted ? W.data() : nullptr);
+                    int64_t dE = weighted ? st.eval_move1(i, j, a) : dW;
                     consider(1, i, j, a, a, 0, dW, dE);
                 }
             }
@@ -478,15 +524,15 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
             for (int b = a + 1; b < 4; ++b) {
                 for (int i : pos[a]) {
                     for (int j : pos[b]) {
-                        int64_t dW = st.eval_move2(i, j, a, b, 1, W.data());
-                        int64_t dE = (stall == 0) ? dW : st.eval_move2(i, j, a, b, 1, nullptr);
+                        int64_t dW = st.eval_move2(i, j, a, b, 1, weighted ? W.data() : nullptr);
+                        int64_t dE = weighted ? st.eval_move2(i, j, a, b, 1) : dW;
                         consider(2, i, j, a, b, 1, dW, dE);
                     }
                 }
                 for (int i : neg[a]) {
                     for (int j : neg[b]) {
-                        int64_t dW = st.eval_move2(i, j, a, b, -1, W.data());
-                        int64_t dE = (stall == 0) ? dW : st.eval_move2(i, j, a, b, -1, nullptr);
+                        int64_t dW = st.eval_move2(i, j, a, b, -1, weighted ? W.data() : nullptr);
+                        int64_t dE = weighted ? st.eval_move2(i, j, a, b, -1) : dW;
                         consider(2, i, j, a, b, -1, dW, dE);
                     }
                 }
@@ -499,8 +545,8 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
                     for (int b = 0; b < 4; ++b) {
                         if (b == a) continue;
                         for (int fb = 0; fb < 2; ++fb) {
-                            int64_t dW = st.eval_move3(i, j, a, b, fb, W.data());
-                            int64_t dE = (stall == 0) ? dW : st.eval_move3(i, j, a, b, fb, nullptr);
+                            int64_t dW = st.eval_move3(i, j, a, b, fb, weighted ? W.data() : nullptr);
+                            int64_t dE = weighted ? st.eval_move3(i, j, a, b, fb) : dW;
                             consider(3, i, j, a, b, fb, dW, dE);
                         }
                     }
@@ -519,24 +565,8 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
         if (st.E < local_best) {
             local_best = st.E;
             stall = 0;
-            int64_t prev = g_best_E.load(std::memory_order_relaxed);
-            while (st.E < prev && !g_best_E.compare_exchange_weak(prev, st.E)) {}
-            if (st.E < prev) {
-                double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-                std::lock_guard<std::mutex> lk(g_io_mtx);
-                std::cout << "[T" << tid << " " << el << "s iter=" << iter << "] new best E=" << st.E << std::endl;
-            }
-            if (st.E == 0) {
-                st.recompute();
-                if (st.E == 0) {
-                    if (!g_found.exchange(true)) {
-                        std::lock_guard<std::mutex> lk(g_io_mtx);
-                        save_witness(out_path, *inst, st);
-                        std::cout << "*** FOUND EXACT VERIFIED T-MATRIX SOLUTION (E=0) SAVED TO " << out_path << " ***" << std::endl;
-                    }
-                    return;
-                }
-            }
+            double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            report_best(st, out_path, "tabu", tid, el, iter);
         } else {
             ++stall;
             // Guided Local Search weight bump on stalled worst shift
@@ -548,10 +578,12 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
                     if (u > worst_util) { worst_util = u; worst_k = k; }
                 }
                 W[worst_k] += 1;
+                weighted = true;
             }
             if (stall >= kick_limit) {
                 // Reset GLS weights and apply random restart or heavy kick
                 std::fill(W.begin(), W.end(), 1);
+                weighted = false;
                 if (rng() % 3 == 0) {
                     st.init_random(rng);
                     local_best = st.E;
@@ -573,6 +605,8 @@ static void worker_tabu(int tid, const Instance* inst, double max_secs, const st
                     }
                     local_best = st.E;
                 }
+                double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                report_best(st, out_path, "tabu", tid, el, iter);
                 std::fill(tabu.begin(), tabu.end(), 0);
                 stall = 0;
             }
@@ -589,9 +623,13 @@ static void worker_sa(int tid, const Instance* inst, double max_secs, const std:
     st.init_random(rng);
 
     // Maintain live lists pos[4], neg[4] and index-in-list for O(1) random move sampling!
-    int pos_list[4][128], neg_list[4][128];
+    std::vector<int> pos_list[4], neg_list[4];
     int pos_sz[4], neg_sz[4];
-    int idx_in_list[128];
+    std::vector<int> idx_in_list(inst->r);
+    for (int a = 0; a < 4; ++a) {
+        pos_list[a].resize(inst->r);
+        neg_list[a].resize(inst->r);
+    }
 
     auto rebuild_lists = [&]() {
         for (int a = 0; a < 4; ++a) pos_sz[a] = neg_sz[a] = 0;
@@ -637,6 +675,7 @@ static void worker_sa(int tid, const Instance* inst, double max_secs, const std:
     double T = T_hi;
     uint64_t step = 0;
     int64_t local_best = st.E;
+    report_best(st, out_path, "sa", tid, 0, 0);
 
     while (!g_found.load(std::memory_order_relaxed)) {
         if ((step & 65535ULL) == 0) {
@@ -650,6 +689,12 @@ static void worker_sa(int tid, const Instance* inst, double max_secs, const std:
             if ((step / cycle_len) % 8 == 0) {
                 st.init_random(rng);
                 rebuild_lists();
+                if (st.E < local_best) {
+                    local_best = st.E;
+                    double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+                    report_best(st, out_path, "sa", tid, el, step);
+                    if (st.E == 0) return;
+                }
                 T = T_hi;
             } else {
                 T = T_hi * (0.4 + 0.6 * u01(rng));
@@ -723,29 +768,13 @@ static void worker_sa(int tid, const Instance* inst, double max_secs, const std:
 
         if (st.E < local_best) {
             local_best = st.E;
-            int64_t prev = g_best_E.load(std::memory_order_relaxed);
-            while (st.E < prev && !g_best_E.compare_exchange_weak(prev, st.E)) {}
-            if (st.E < prev) {
-                double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
-                std::lock_guard<std::mutex> lk(g_io_mtx);
-                std::cout << "[SA-T" << tid << " " << el << "s step=" << step << " T=" << T << "] new best E=" << st.E << std::endl;
-            }
-            if (st.E == 0) {
-                st.recompute();
-                if (st.E == 0) {
-                    if (!g_found.exchange(true)) {
-                        std::lock_guard<std::mutex> lk(g_io_mtx);
-                        save_witness(out_path, *inst, st);
-                        std::cout << "*** FOUND EXACT VERIFIED T-MATRIX SOLUTION (E=0) SAVED TO " << out_path << " ***" << std::endl;
-                    }
-                    return;
-                }
-            }
+            double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            report_best(st, out_path, "sa", tid, el, step);
         }
     }
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     if (argc < 9) {
         std::cerr << "Usage: ./tmatrix_solver <t> <g> <m1> <m2> <m3> <m4> <secs> <out_json> [threads=1] [mode=sa|tabu|hybrid]\n";
         return 1;
@@ -761,7 +790,27 @@ int main(int argc, char** argv) {
     int threads = (argc >= 10) ? std::stoi(argv[9]) : 1;
     std::string mode = (argc >= 11) ? argv[10] : "sa";
 
+    if (t < 1 || g < 0 || g >= t || std::gcd(t, g) != 1) {
+        std::cerr << "Expected positive t and a unit g with 0 <= g < t\n";
+        return 1;
+    }
+    if (!std::isfinite(secs) || secs <= 0 || threads <= 0 ||
+        (mode != "sa" && mode != "tabu" && mode != "hybrid")) {
+        std::cerr << "Expected positive secs and threads, and mode sa, tabu, or hybrid\n";
+        return 1;
+    }
     Instance inst = build_instance(t, g, m1, m2, m3, m4);
+    if (!std::all_of(inst.orbits.begin() + 1, inst.orbits.end(),
+                     [&](const auto& orbit) { return orbit.size() == static_cast<size_t>(inst.h); })) {
+        std::cerr << "All nonzero orbits must have the same size\n";
+        return 1;
+    }
+    int64_t remaining = inst.r - 1;
+    for (int m : inst.m_target) remaining -= std::abs(static_cast<int64_t>(m));
+    if (remaining < 0 || remaining % 2 != 0) {
+        std::cerr << "Orbit-sum targets cannot be achieved with the available orbits\n";
+        return 1;
+    }
     self_check_deltas(inst);
     std::cout << "tmatrix_solver: t=" << t << " g=" << g << " |U|=" << inst.h
               << " r=" << inst.r << " K=" << inst.K
@@ -780,5 +829,8 @@ int main(int argc, char** argv) {
     if (!g_found.load()) {
         std::cout << "Finished " << secs << "s without E=0. Global best E=" << g_best_E.load() << std::endl;
     }
-    return 0;
+    return g_witness_failed ? 2 : 0;
+} catch (const std::exception& e) {
+    std::cerr << "tmatrix_solver: " << e.what() << '\n';
+    return 1;
 }
