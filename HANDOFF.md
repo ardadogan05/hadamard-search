@@ -111,3 +111,45 @@ g++ -std=c++20 -O3 -march=native -pthread tmatrix_solver.cpp -o tmatrix_solver
 ./tmatrix_solver 151 8 0 2 1 1 45 /tmp/tmatrix-151.json 2 hybrid
 ./tmatrix_solver 463 15 -1 1 1 1 60 /tmp/tmatrix-463.json 2 hybrid
 ```
+
+## Session 4 results
+
+- **Order 6236, `g=119`.** All 24 normalized lifts through modulus 38
+  are incompatible with the modulus-82 energy. The CRT orbit partition
+  makes each modulus-82 entry `s + 18t`, where `s = ±1` and
+  `t ∈ {-1, 0, 1}`. The required energy forces the weighted sum of
+  `t²` into `[17, 20]`. The modulus-38 lifts force it to be
+  `6 mod 10`. A separate direct enumeration reproduced the exclusion.
+  Run `python3 -u decompress_r54.py 6236`.
+- **Split Theorem 7.** `HadamardSigma3.card_eq_one_of_paf` derives the
+  row and quotient norms from the split autocorrelation identities and
+  proves that the subgroup has one element, forcing order 28.
+  `cd lean && lake build` checks the proof.
+- **Published order 1948.** `HadamardWitness1948.hadamard_order_1948`
+  proves the exact matrix identity from the published sign sequences.
+  Multiplication and reversal reduce the certificate to 27 shift
+  representatives. Lean checks all the reductions and equations with
+  standard axioms. Build the concrete witness with
+  `cd lean && lake build HadamardWitness1948`.
+- **Order 4412 row completion.** `python3 analyze_4412.py` gives the
+  prime-field reduction. Three rows and the fourth row's odd moments
+  determine its 29 even coefficients, with an exact signed-completion
+  test. `python3 analyze_4412.py --binary` gives a separate necessary
+  binary-field condition. Once three rows are fixed, a nonzero residual
+  norm leaves at most `2^29 - 1` fourth-row projections before the row
+  size and integer autocorrelation checks. Both models recovered the
+  published order-1948 rows used for calibration.
+- **Meet-in-the-middle.** The paired solver generates individual rows
+  with exact row sums and matches complementary autocorrelation vectors
+  up to joint rotation. The injected order-1948 control passed
+  `verify.py`. With identical blind pools of 400 rows per sequence,
+  canonical pair matching reduced full run time from 22.73 to 3.94
+  seconds at 1948 and from 30.96 to 3.92 seconds at 4412. These bounded
+  pools contained no witness.
+
+The order-4412 pair benchmark can be reproduced after building `solver_v3`.
+
+```sh
+./solver_v3 1103 749 0 90 /tmp/mitm-4412.json 1 --mode=mitm \
+  --ts=1,37,39,39 --seed=4412 --mitm_pool=400 --mitm_flat_max=4400
+```
