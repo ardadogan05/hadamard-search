@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef __AVX2__
@@ -2118,108 +2119,104 @@ void worker_sa(int tid, const OrbitProblem& prob, double max_seconds,
     }
 }
 
-// Worker D: Record-to-Record Travel / Threshold Accepting (zero exp(), ~5M+ swaps/s)
-void worker_rrt(int tid, const OrbitProblem& prob, double max_seconds,
-                double w_flat, const std::string& out_path, uint64_t seed) {
+// Record-to-record travel with an optional flatness term in the record itself.
+void worker_rrt(int tid, const OrbitProblem& prob, double max_seconds, double w_flat,
+                uint64_t stage_steps, const std::string& out_path, uint64_t seed) {
     std::mt19937_64 mt_rng(seed);
     uint64_t rng_s = seed ^ 0xd1b54a32d192ed03ULL;
     if (rng_s == 0) rng_s = 1;
     auto t0 = std::chrono::steady_clock::now();
+    auto expired = [&] {
+        return g_found.load(std::memory_order_relaxed) ||
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= max_seconds;
+    };
 
     SearchState st(prob);
-    st.randomize_manifold(mt_rng);
-    record_if_best(tid, "RRT-init", prob, st, t0, out_path);
-    if (g_found.load(std::memory_order_relaxed)) return;
-
-    int64_t best_E = st.E_ac;
-    std::vector<int> best_seq[4];
-    for (int s = 0; s < 4; ++s) best_seq[s] = st.seq[s];
-
     std::vector<std::vector<int>> pos_g[4], neg_g[4];
-    size_t G = prob.size_groups.size();
-    if (G == 0) return;
-    build_pos_neg_lists(st, pos_g, neg_g);
+    std::vector<std::pair<int, size_t>> active_groups;
+    const int64_t slacks[] = {256, 192, 160, 128, 96, 64, 32, 0};
+    constexpr uint64_t block = 4096;
+    int64_t best_E = INT64_MAX;
+    std::vector<int> best_seq[4];
 
-    const int64_t deltas[] = {256, 192, 160, 128, 96, 64, 32, 0};
-    const int n_deltas = (int)(sizeof(deltas) / sizeof(deltas[0]));
-    const uint64_t STAGE_STEPS = 800000ULL;
-    const uint64_t BLOCK = 4096ULL;
-    int64_t rec_E = st.E_ac;
-    uint64_t cycle = 0;
-
-    while (!g_found.load(std::memory_order_relaxed)) {
-        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (el >= max_seconds) break;
-
-        if (cycle > 0) {
-            if ((fast_rng(rng_s) % 10) < 5) {
-                for (int s = 0; s < 4; ++s) st.seq[s] = best_seq[s];
-                st.recompute();
-                rec_E = st.E_ac;
-            } else {
-                st.randomize_manifold(mt_rng);
-                rec_E = st.E_ac;
-            }
-            build_pos_neg_lists(st, pos_g, neg_g);
+    while (!expired()) {
+        if (best_E != INT64_MAX && fast_rng(rng_s) % 2 == 0) {
+            for (int s = 0; s < 4; ++s) st.seq[s] = best_seq[s];
+            st.recompute();
+        } else {
+            st.randomize_manifold(mt_rng);
         }
+        if (st.E_ac < best_E) {
+            best_E = st.E_ac;
+            for (int s = 0; s < 4; ++s) best_seq[s] = st.seq[s];
+        }
+        record_if_best(tid, "RRT-init", prob, st, t0, out_path);
 
-        for (int di = 0; di < n_deltas; ++di) {
-            int64_t delta = deltas[di];
-            double wf = (w_flat > 0.0 && delta > 0) ? w_flat : 0.0;
-            for (uint64_t step_base = 0; step_base < STAGE_STEPS; step_base += BLOCK) {
-                if (g_found.load(std::memory_order_relaxed)) return;
-                double elc = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                if (elc >= max_seconds) return;
+        build_pos_neg_lists(st, pos_g, neg_g);
+        active_groups.clear();
+        for (int s = 0; s < 4; ++s) {
+            for (size_t g = 0; g < prob.size_groups.size(); ++g) {
+                if (!pos_g[s][g].empty() && !neg_g[s][g].empty()) {
+                    active_groups.emplace_back(s, g);
+                }
+            }
+        }
+        if (active_groups.empty()) continue;
 
-                int64_t limit = rec_E + delta;
-                for (uint64_t b = 0; b < BLOCK; ++b) {
-                    int s = (int)(fast_rng(rng_s) & 3);
-                    size_t g = (G == 1) ? 0 : (size_t)(fast_rng(rng_s) % G);
-                    auto& pvec = pos_g[s][g];
-                    auto& nvec = neg_g[s][g];
-                    if (pvec.empty() || nvec.empty()) continue;
-                    size_t ip = (size_t)(fast_rng(rng_s) % pvec.size());
-                    size_t jn = (size_t)(fast_rng(rng_s) % nvec.size());
-                    int i = pvec[ip];
-                    int j = nvec[jn];
+        // Keep the flatness term through the final stage. Otherwise the search
+        // drops the hard-won spectral structure as the threshold tightens.
+        double record_score = st.E_ac + w_flat * st.E_flat;
+        for (int64_t slack : slacks) {
+            for (uint64_t step = 0; step < stage_steps;) {
+                if (expired()) return;
+                uint64_t steps = std::min(block, stage_steps - step);
+                for (uint64_t b = 0; b < steps; ++b) {
+                    auto [s, g] = active_groups[fast_rng(rng_s) % active_groups.size()];
+                    auto& positives = pos_g[s][g];
+                    auto& negatives = neg_g[s][g];
+                    size_t ip = fast_rng(rng_s) % positives.size();
+                    size_t jn = fast_rng(rng_s) % negatives.size();
+                    int i = positives[ip];
+                    int j = negatives[jn];
 
-                    int64_t dac = 0, dflat = 0;
-                    bool accept = false;
-                    if (wf > 0.0) {
+                    int64_t dac, dflat = 0, dg = 0, da = 0;
+                    if (w_flat > 0.0) {
                         st.eval_swap_pos_neg_flat(s, i, j, dac, dflat);
-                        int64_t new_ac = st.E_ac + dac;
-                        if (new_ac <= limit) {
-                            // Bias toward flatter sequences when moving sideways/uphill
-                            double score = (double)dac + wf * (double)dflat;
-                            if (new_ac < rec_E || score <= (double)(limit - st.E_ac)) accept = true;
-                        }
                     } else {
-                        int64_t dg, da;
                         st.eval_swap_pos_neg(s, i, j, dac, dg, da);
-                        if (st.E_ac + dac <= limit) accept = true;
                     }
+                    double next_score = (st.E_ac + dac) + w_flat * (st.E_flat + dflat);
+                    if (next_score > record_score + slack) continue;
 
-                    if (accept) {
-                        st.apply_swap(s, i, j, dac, dac, 0);
-                        st.E_flat += dflat;
-                        pvec[ip] = j;
-                        nvec[jn] = i;
-                        if (st.E_ac < rec_E) {
-                            rec_E = st.E_ac;
-                            limit = rec_E + delta;
-                            if (st.E_ac < best_E) {
-                                best_E = st.E_ac;
-                                for (int q = 0; q < 4; ++q) best_seq[q] = st.seq[q];
-                                record_if_best(tid, "RRT", prob, st, t0, out_path);
-                                if (g_found.load(std::memory_order_relaxed)) return;
-                            }
+                    if (w_flat > 0.0 && prob.use_alt) {
+                        st.eval_swap_pos_neg(s, i, j, dac, dg, da);
+                    }
+                    st.apply_swap(s, i, j, dac, dac, da);
+                    st.E_flat += dflat;
+                    positives[ip] = j;
+                    negatives[jn] = i;
+                    record_score = std::min(record_score, next_score);
+                    if (st.E_ac < best_E) {
+                        best_E = st.E_ac;
+                        for (int q = 0; q < 4; ++q) best_seq[q] = st.seq[q];
+                        record_if_best(tid, "RRT", prob, st, t0, out_path);
+                        if (g_found.load(std::memory_order_relaxed)) {
+                            g_pt_steps.fetch_add(b + 1, std::memory_order_relaxed);
+                            return;
                         }
                     }
                 }
-                g_pt_steps.fetch_add(BLOCK, std::memory_order_relaxed);
+                step += steps;
+                g_pt_steps.fetch_add(steps, std::memory_order_relaxed);
             }
         }
-        ++cycle;
+        if (st.E_ac <= g_two_opt_thresh) {
+            polish_2opt(tid, st, t0, max_seconds, out_path, 32);
+            if (st.E_ac < best_E) {
+                best_E = st.E_ac;
+                for (int s = 0; s < 4; ++s) best_seq[s] = st.seq[s];
+            }
+        }
     }
 }
 
@@ -2242,7 +2239,7 @@ int main(int argc, char** argv) {
                   << " [--gens=g1,g2,...] [--ts=s0,s1,s2,s3] [--w_row=64] [--w_alt=16]"
                   << " [--lock_row=0|1] [--flat_init=0|1] [--w_flat=0.0] [--sa_thi=220] [--sa_tlo=10]"
                   << " [--target_alt=a0,a1,a2,a3] [--mode=hybrid|ils|pt|sa|rrt] [--gls=1|0]"
-                  << " [--save_best=<path>] [--two_opt_thresh=2000]\n";
+                  << " [--save_best=<path>] [--two_opt_thresh=2000] [--seed=<uint64>] [--rrt_stage_steps=800000]\n";
         return 1;
     }
     int m = std::stoi(argv[1]);
@@ -2263,6 +2260,8 @@ int main(int argc, char** argv) {
     double sa_tlo = 10.0;
     std::string mode = "hybrid";
     bool use_gls = true;
+    uint64_t base_seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+    uint64_t rrt_stage_steps = 800000;
 
     std::vector<std::string> pos;
     for (int i = 6; i < argc; ++i) {
@@ -2296,6 +2295,10 @@ int main(int argc, char** argv) {
             gens = parse_int_list(argv[++i]);
         } else if (a == "-g" && i + 1 < argc) {
             gens = parse_int_list(argv[++i]);
+        } else if (a.rfind("--seed=", 0) == 0) {
+            base_seed = std::stoull(a.substr(7));
+        } else if (a.rfind("--rrt_stage_steps=", 0) == 0) {
+            rrt_stage_steps = std::stoull(a.substr(18));
         } else if (a.rfind("--mode=", 0) == 0) {
             mode = a.substr(7);
         } else if (a.rfind("--gls=", 0) == 0) {
@@ -2313,6 +2316,11 @@ int main(int argc, char** argv) {
     if (!pos.empty()) threads = std::stoi(pos[0]);
     if (pos.size() >= 5) {
         for (int i = 0; i < 4; ++i) ts[i] = std::stoi(pos[1 + i]);
+    }
+
+    if (rrt_stage_steps == 0 || !std::isfinite(w_flat) || w_flat < 0) {
+        std::cerr << "Expected positive RRT stage steps and a finite, nonnegative flatness weight.\n";
+        return 1;
     }
 
     OrbitProblem prob = build_problem(m, gens, b, ts, w_row, w_alt, lock_row, flat_init, use_talt, talt);
@@ -2339,7 +2347,9 @@ int main(int argc, char** argv) {
 #else
     std::cout << ", simd=scalar";
 #endif
-    std::cout << ", threads=" << threads << std::endl;
+    std::cout << ", threads=" << threads << ", seed=" << base_seed;
+    if (mode == "rrt") std::cout << ", rrt_stage_steps=" << rrt_stage_steps;
+    std::cout << std::endl;
 
     if (prob.infeasible) {
         std::cout << "INFEASIBLE (pre-check): " << prob.infeasible_reason << std::endl;
@@ -2347,13 +2357,12 @@ int main(int argc, char** argv) {
     }
 
     std::vector<std::thread> pool;
-    uint64_t base_seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
     for (int t = 0; t < threads; ++t) {
         uint64_t seed = base_seed + 1000003ULL * t;
         if (mode == "sa") {
             pool.emplace_back(worker_sa, t, std::cref(prob), secs, w_flat, sa_thi, sa_tlo, out_path, seed);
         } else if (mode == "rrt") {
-            pool.emplace_back(worker_rrt, t, std::cref(prob), secs, w_flat, out_path, seed);
+            pool.emplace_back(worker_rrt, t, std::cref(prob), secs, w_flat, rrt_stage_steps, out_path, seed);
         } else if (mode == "pt" || (mode == "hybrid" && (t & 1) == 1)) {
             pool.emplace_back(worker_pt, t, std::cref(prob), secs, out_path, seed);
         } else {
