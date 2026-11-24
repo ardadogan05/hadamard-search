@@ -221,6 +221,18 @@ class BinaryOrbitProjection:
             norm ^= self.multiply(a, b)
         return norm
 
+    def mask_from_packed(self, value):
+        """Apply the linear inverse to packed parity and field coordinates."""
+        mask = 0
+        while value:
+            pivot = self.pivots.get(value.bit_length() - 1)
+            if pivot is None:
+                return None
+            basis, origin = pivot
+            value ^= basis
+            mask ^= origin
+        return mask
+
     def complete(self, norm, projection, row_sum, *, reverse=False):
         """Complete one projection. At zero norm try both orientations."""
         size = (self.model.p - row_sum) // 2
@@ -234,19 +246,59 @@ class BinaryOrbitProjection:
         forward, backward = (other, projection) if reverse else (projection, other)
         if self.multiply(forward, backward) != norm:
             return None
-        value = self._pack(size % 2, forward, backward)
-        mask = 0
-        while value:
-            pivot = self.pivots.get(value.bit_length() - 1)
-            if pivot is None:
-                return None
-            basis, origin = pivot
-            value ^= basis
-            mask ^= origin
+        mask = self.mask_from_packed(self._pack(size % 2, forward, backward))
+        if mask is None:
+            return None
         signs = [-1 if mask >> i & 1 else 1 for i in range(self.model.q + 1)]
         if signs[0] + self.model.h * sum(signs[1:]) == row_sum:
             return signs
         return None
+
+
+def export_binary_scan(path, model, other_rows, row_sum):
+    """Write the exact fixed-triple inputs for scan_binary_4412.cpp."""
+    if model.p != 1103 or model.h != 19:
+        raise ValueError('the binary scanner requires length 1103 and multiplier order 19')
+    if sum((row[0] + model.h * sum(row[1:])) ** 2 for row in other_rows) + row_sum**2 != 4 * model.p:
+        raise ValueError('row-sum squares must add to 4412')
+    binary = BinaryOrbitProjection(model)
+    norm = binary.remaining_norm(other_rows)
+    if not norm:
+        raise ValueError('the binary scanner requires a nonzero residual norm')
+    inverse_columns = [binary.mask_from_packed(1 << bit) for bit in range(1 + 2 * binary.degree)]
+    if any(col is None for col in inverse_columns):
+        raise ValueError('the inverse does not cover all packed coordinates')
+
+    orbit_ids = [0] * model.p
+    for i, orbit in enumerate(model.orbits):
+        for x in orbit:
+            orbit_ids[x] = i
+    supports = [[int(row[i] == -1) for i in orbit_ids] for row in other_rows]
+    size = (model.p - row_sum) // 2
+    if not 0 <= size <= model.p or model.p - 2 * size != row_sum:
+        raise ValueError('invalid missing row sum')
+    threshold = sum(sum(support) for support in supports) + size - model.p
+    shifts = []
+    seen = {0}
+    for orbit in model.orbits[1:]:
+        d = orbit[0]
+        if orbit_ids[d] in seen:
+            continue
+        seen.update((orbit_ids[d], orbit_ids[-d % model.p]))
+        residual = threshold - sum(
+            support[x] * support[(x + d) % model.p]
+            for support in supports for x in range(model.p)
+        )
+        shifts.append((d, residual))
+
+    lines = [
+        f'{norm} {size}',
+        ' '.join(map(str, inverse_columns)),
+        ' '.join(map(str, orbit_ids)),
+        *(f'{shift} {residual}' for shift, residual in shifts),
+    ]
+    path.write_text('\n'.join(lines) + '\n')
+    print(f'Wrote fixed-triple scan input to {path} (norm={norm:#x}, size={size}, shifts={len(shifts)}).')
 
 
 def main():
@@ -254,8 +306,11 @@ def main():
     parser.add_argument('candidate', type=Path, nargs='?', help='optional b=0 candidate JSON')
     parser.add_argument('--row', type=int, choices=range(1, 5), default=1, help='row to complete (1–4)')
     parser.add_argument('--binary', action='store_true', help='complete from one binary field projection')
+    parser.add_argument('--export-binary-scan', type=Path, help='write fixed-triple input for scan_binary_4412.cpp')
     args = parser.parse_args()
     if args.candidate is None:
+        if args.export_binary_scan:
+            parser.error('--export-binary-scan requires a candidate JSON')
         model = OrbitMoments(1103, 749)
         if args.binary:
             binary = BinaryOrbitProjection(model)
@@ -274,6 +329,12 @@ def main():
     row = rows[args.row - 1]
     others = rows[:args.row - 1] + rows[args.row:]
     row_sum = row[0] + model.h * sum(row[1:])
+    if args.export_binary_scan:
+        try:
+            export_binary_scan(args.export_binary_scan, model, others, row_sum)
+        except ValueError as error:
+            parser.error(str(error))
+        return 0
     if args.binary:
         binary = BinaryOrbitProjection(model)
         forward, backward = binary.project(row)
