@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 lean/.lake/
 test_*.json
+tmatrix_solver

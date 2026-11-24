@@ -542,6 +542,7 @@ struct SearchState {
     int r, K, Kpad;
     std::vector<int> seq[4];
     std::vector<int> P;
+    std::vector<int> P_seq[4];
     std::vector<int> grad;
     std::vector<int> shift_w;
     bool gls_active = false;
@@ -549,6 +550,7 @@ struct SearchState {
     int alt[4];
     int64_t S_alt;
     int64_t E_ac;
+    int64_t E_flat;
     int64_t E_row; // raw sum (rsum[s] - target_s[s])^2
     int64_t E_true; // E_ac + BASE_ROW_WEIGHT * E_row
     int64_t E_gls;  // sum shift_w[k]*P[k]^2 + prob->w_row * E_row
@@ -557,7 +559,7 @@ struct SearchState {
 
     SearchState()
         : prob(nullptr), r(0), K(0), Kpad(0), S_alt(0),
-          E_ac(0), E_row(0), E_true(0), E_gls(0), E_alt(0), E_search(0) {}
+          E_ac(0), E_flat(0), E_row(0), E_true(0), E_gls(0), E_alt(0), E_search(0) {}
 
     explicit SearchState(const OrbitProblem& p)
         : prob(&p), r(p.r), K(p.K), Kpad(p.Kpad),
@@ -565,11 +567,12 @@ struct SearchState {
         for (int k = 0; k < K; ++k) shift_w[k] = 1;
         for (int s = 0; s < 4; ++s) {
             seq[s].assign(r, 1);
+            P_seq[s].assign(p.Kpad, 0);
             rsum[s] = 0;
             alt[s] = 0;
         }
         S_alt = 0;
-        E_ac = E_row = E_true = E_gls = E_alt = E_search = 0;
+        E_ac = E_flat = E_row = E_true = E_gls = E_alt = E_search = 0;
     }
 
     void reset_gls_weights() {
@@ -621,9 +624,11 @@ struct SearchState {
             S_alt += (int64_t)al * al;
             int64_t dr = rs - prob->target_s[s];
             E_row += dr * dr;
+            std::fill(P_seq[s].begin(), P_seq[s].end(), 0);
         }
         std::fill(P.begin(), P.end(), 0);
         std::fill(grad.begin(), grad.end(), 0);
+        int64_t ef = 0;
         for (int k = 0; k < K; ++k) {
             int64_t pk = 4LL * prob->diag_const[k] - prob->target_ac;
             for (int s = 0; s < 4; ++s) {
@@ -637,10 +642,14 @@ struct SearchState {
                     grad[((size_t)s * r + i) * Kpad + k] = (int)gval;
                     acc += (int64_t)seq[s][i] * gval;
                 }
+                int64_t psk = prob->diag_const[k] + acc / 2;
+                P_seq[s][k] = (int)psk;
+                ef += psk * psk;
                 pk += acc / 2;
             }
             P[k] = (int)pk;
         }
+        E_flat = ef;
         int64_t et = 0, eg = 0;
         for (int k = 0; k < K; ++k) {
             int64_t p2 = (int64_t)P[k] * P[k];
@@ -1217,6 +1226,50 @@ struct SearchState {
         }
     }
 
+    // Fast AVX2 swap assuming seq[s][i]==+1, seq[s][j]==-1, returning both d_ac and d_flat
+    inline void eval_swap_pos_neg_flat(int s, int i, int j, int64_t& d_ac, int64_t& d_flat) const {
+        const int* __restrict__ gi = &grad[((size_t)s * r + i) * Kpad];
+        const int* __restrict__ gj = &grad[((size_t)s * r + j) * Kpad];
+        const int* __restrict__ mij = &prob->MT[((size_t)i * r + j) * Kpad];
+        const int* __restrict__ pptr = P.data();
+        const int* __restrict__ psptr = P_seq[s].data();
+#ifdef __AVX2__
+        __m256i acc_t = _mm256_setzero_si256();
+        __m256i acc_f = _mm256_setzero_si256();
+        for (int k = 0; k < Kpad; k += 8) {
+            __m256i vgi = _mm256_loadu_si256((const __m256i*)(gi + k));
+            __m256i vgj = _mm256_loadu_si256((const __m256i*)(gj + k));
+            __m256i vmij = _mm256_loadu_si256((const __m256i*)(mij + k));
+            __m256i vp = _mm256_loadu_si256((const __m256i*)(pptr + k));
+            __m256i vps = _mm256_loadu_si256((const __m256i*)(psptr + k));
+            __m256i vdp = _mm256_sub_epi32(_mm256_slli_epi32(_mm256_sub_epi32(vgj, vgi), 1),
+                                           _mm256_slli_epi32(vmij, 2));
+            __m256i vdp_od = _mm256_srli_epi64(vdp, 32);
+
+            __m256i vsum = _mm256_add_epi32(_mm256_slli_epi32(vp, 1), vdp);
+            __m256i ev_t = _mm256_mul_epi32(vdp, vsum);
+            __m256i od_t = _mm256_mul_epi32(vdp_od, _mm256_srli_epi64(vsum, 32));
+            acc_t = _mm256_add_epi64(acc_t, _mm256_add_epi64(ev_t, od_t));
+
+            __m256i vfsum = _mm256_add_epi32(_mm256_slli_epi32(vps, 1), vdp);
+            __m256i ev_f = _mm256_mul_epi32(vdp, vfsum);
+            __m256i od_f = _mm256_mul_epi32(vdp_od, _mm256_srli_epi64(vfsum, 32));
+            acc_f = _mm256_add_epi64(acc_f, _mm256_add_epi64(ev_f, od_f));
+        }
+        d_ac = hsum_epi64(acc_t);
+        d_flat = hsum_epi64(acc_f);
+#else
+        int64_t dt = 0, df = 0;
+        for (int k = 0; k < Kpad; ++k) {
+            int64_t dp = 2LL * (gj[k] - gi[k]) - 4LL * mij[k];
+            dt += dp * (2LL * pptr[k] + dp);
+            df += dp * (2LL * psptr[k] + dp);
+        }
+        d_ac = dt;
+        d_flat = df;
+#endif
+    }
+
     inline void apply_flip_core(int s, int i) {
         int si = seq[s][i];
         seq[s][i] = -si;
@@ -1229,8 +1282,11 @@ struct SearchState {
         const int factor = -2 * si;
         const int* __restrict__ gptr = &grad[((size_t)s * r + i) * Kpad];
         int* __restrict__ pptr = P.data();
+        int* __restrict__ psptr = P_seq[s].data();
         for (int k = 0; k < Kpad; ++k) {
-            pptr[k] += factor * gptr[k];
+            int delta = factor * gptr[k];
+            pptr[k] += delta;
+            psptr[k] += delta;
         }
         const int* __restrict__ mptr_base = &prob->MT[((size_t)i * r) * Kpad];
         int* __restrict__ gbase = &grad[((size_t)s * r) * Kpad];
@@ -1921,6 +1977,252 @@ void worker_gls_ils(int tid, const OrbitProblem& prob, double max_seconds,
     }
 }
 
+static inline uint64_t fast_rng(uint64_t& s) {
+    s ^= s >> 12;
+    s ^= s << 25;
+    s ^= s >> 27;
+    return s * 0x2545F4914F6CDD1DULL;
+}
+
+static inline double fast_u01(uint64_t& s) {
+    return (double)(fast_rng(s) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+static void build_pos_neg_lists(const SearchState& st,
+                                std::vector<std::vector<int>> pos_g[4],
+                                std::vector<std::vector<int>> neg_g[4]) {
+    const OrbitProblem& prob = *st.prob;
+    size_t G = prob.size_groups.size();
+    for (int s = 0; s < 4; ++s) {
+        pos_g[s].assign(G, {});
+        neg_g[s].assign(G, {});
+        for (size_t g = 0; g < G; ++g) {
+            for (int idx : prob.size_groups[g]) {
+                if (st.seq[s][idx] > 0) pos_g[s][g].push_back(idx);
+                else neg_g[s][g].push_back(idx);
+            }
+        }
+    }
+}
+
+// Worker C: Tight-Band Reheat Simulated Annealing (O(1) pos/neg sampling + optional active flatness)
+void worker_sa(int tid, const OrbitProblem& prob, double max_seconds,
+               double w_flat, double t_hi, double t_lo,
+               const std::string& out_path, uint64_t seed) {
+    std::mt19937_64 mt_rng(seed);
+    uint64_t rng_s = seed ^ 0x9e3779b97f4a7c15ULL;
+    if (rng_s == 0) rng_s = 1;
+    auto t0 = std::chrono::steady_clock::now();
+
+    SearchState st(prob);
+    st.randomize_manifold(mt_rng);
+    record_if_best(tid, "SA-init", prob, st, t0, out_path);
+    if (g_found.load(std::memory_order_relaxed)) return;
+
+    int64_t best_E = st.E_ac;
+    std::vector<int> best_seq[4];
+    for (int s = 0; s < 4; ++s) best_seq[s] = st.seq[s];
+
+    std::vector<std::vector<int>> pos_g[4], neg_g[4];
+    size_t G = prob.size_groups.size();
+    if (G == 0) return;
+    build_pos_neg_lists(st, pos_g, neg_g);
+
+    const uint64_t CYCLE_STEPS = 8000000ULL;
+    const uint64_t BLOCK = 4096ULL;
+    uint64_t cycle = 0;
+
+    while (!g_found.load(std::memory_order_relaxed)) {
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el >= max_seconds) break;
+
+        double t_start = t_hi;
+        if (cycle > 0) {
+            if ((fast_rng(rng_s) % 10) < 6) {
+                // Reheat from best state to mid-high band
+                for (int s = 0; s < 4; ++s) st.seq[s] = best_seq[s];
+                st.recompute();
+                t_start = t_lo + (t_hi - t_lo) * (0.4 + 0.6 * fast_u01(rng_s));
+            } else {
+                // Fresh flat-seeded restart
+                st.randomize_manifold(mt_rng);
+                t_start = t_hi;
+            }
+            build_pos_neg_lists(st, pos_g, neg_g);
+        }
+
+        double log_ratio = std::log(t_lo / t_start);
+        for (uint64_t step_base = 0; step_base < CYCLE_STEPS; step_base += BLOCK) {
+            if (g_found.load(std::memory_order_relaxed)) return;
+            double elc = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (elc >= max_seconds) return;
+
+            double frac = (double)step_base / (double)CYCLE_STEPS;
+            double T = t_start * std::exp(log_ratio * frac);
+            double invT = 1.0 / T;
+            double wf = (w_flat > 0.0 && st.E_ac > 160) ? (w_flat * (1.0 - 0.85 * frac)) : 0.0;
+
+            for (uint64_t b = 0; b < BLOCK; ++b) {
+                int s = (int)(fast_rng(rng_s) & 3);
+                size_t g = (G == 1) ? 0 : (size_t)(fast_rng(rng_s) % G);
+                auto& pvec = pos_g[s][g];
+                auto& nvec = neg_g[s][g];
+                if (pvec.empty() || nvec.empty()) continue;
+                size_t ip = (size_t)(fast_rng(rng_s) % pvec.size());
+                size_t jn = (size_t)(fast_rng(rng_s) % nvec.size());
+                int i = pvec[ip];
+                int j = nvec[jn];
+
+                int64_t dac = 0, dflat = 0;
+                double deff = 0.0;
+                if (wf > 0.0) {
+                    st.eval_swap_pos_neg_flat(s, i, j, dac, dflat);
+                    deff = (double)dac + wf * (double)dflat;
+                } else {
+                    int64_t dg, da;
+                    st.eval_swap_pos_neg(s, i, j, dac, dg, da);
+                    deff = (double)dac;
+                }
+
+                bool accept = (deff <= 0.0);
+                if (!accept) {
+                    double x = deff * invT;
+                    if (x < 18.0 && fast_u01(rng_s) < std::exp(-x)) accept = true;
+                }
+                if (accept) {
+                    st.apply_swap(s, i, j, dac, dac, 0);
+                    st.E_flat += dflat;
+                    pvec[ip] = j;
+                    nvec[jn] = i;
+                    if (st.E_ac < best_E) {
+                        best_E = st.E_ac;
+                        for (int q = 0; q < 4; ++q) best_seq[q] = st.seq[q];
+                        record_if_best(tid, "SA", prob, st, t0, out_path);
+                        if (g_found.load(std::memory_order_relaxed)) return;
+                    }
+                }
+            }
+            g_pt_steps.fetch_add(BLOCK, std::memory_order_relaxed);
+        }
+
+        // Quick greedy 1-swap polish at T_lo
+        if (st.E_ac <= g_two_opt_thresh) {
+            polish_2opt(tid, st, t0, max_seconds, out_path, 32);
+            if (g_found.load(std::memory_order_relaxed)) return;
+            if (st.E_ac < best_E) {
+                best_E = st.E_ac;
+                for (int q = 0; q < 4; ++q) best_seq[q] = st.seq[q];
+            }
+        }
+        ++cycle;
+    }
+}
+
+// Worker D: Record-to-Record Travel / Threshold Accepting (zero exp(), ~5M+ swaps/s)
+void worker_rrt(int tid, const OrbitProblem& prob, double max_seconds,
+                double w_flat, const std::string& out_path, uint64_t seed) {
+    std::mt19937_64 mt_rng(seed);
+    uint64_t rng_s = seed ^ 0xd1b54a32d192ed03ULL;
+    if (rng_s == 0) rng_s = 1;
+    auto t0 = std::chrono::steady_clock::now();
+
+    SearchState st(prob);
+    st.randomize_manifold(mt_rng);
+    record_if_best(tid, "RRT-init", prob, st, t0, out_path);
+    if (g_found.load(std::memory_order_relaxed)) return;
+
+    int64_t best_E = st.E_ac;
+    std::vector<int> best_seq[4];
+    for (int s = 0; s < 4; ++s) best_seq[s] = st.seq[s];
+
+    std::vector<std::vector<int>> pos_g[4], neg_g[4];
+    size_t G = prob.size_groups.size();
+    if (G == 0) return;
+    build_pos_neg_lists(st, pos_g, neg_g);
+
+    const int64_t deltas[] = {256, 192, 160, 128, 96, 64, 32, 0};
+    const int n_deltas = (int)(sizeof(deltas) / sizeof(deltas[0]));
+    const uint64_t STAGE_STEPS = 800000ULL;
+    const uint64_t BLOCK = 4096ULL;
+    int64_t rec_E = st.E_ac;
+    uint64_t cycle = 0;
+
+    while (!g_found.load(std::memory_order_relaxed)) {
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el >= max_seconds) break;
+
+        if (cycle > 0) {
+            if ((fast_rng(rng_s) % 10) < 5) {
+                for (int s = 0; s < 4; ++s) st.seq[s] = best_seq[s];
+                st.recompute();
+                rec_E = st.E_ac;
+            } else {
+                st.randomize_manifold(mt_rng);
+                rec_E = st.E_ac;
+            }
+            build_pos_neg_lists(st, pos_g, neg_g);
+        }
+
+        for (int di = 0; di < n_deltas; ++di) {
+            int64_t delta = deltas[di];
+            double wf = (w_flat > 0.0 && delta > 0) ? w_flat : 0.0;
+            for (uint64_t step_base = 0; step_base < STAGE_STEPS; step_base += BLOCK) {
+                if (g_found.load(std::memory_order_relaxed)) return;
+                double elc = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (elc >= max_seconds) return;
+
+                int64_t limit = rec_E + delta;
+                for (uint64_t b = 0; b < BLOCK; ++b) {
+                    int s = (int)(fast_rng(rng_s) & 3);
+                    size_t g = (G == 1) ? 0 : (size_t)(fast_rng(rng_s) % G);
+                    auto& pvec = pos_g[s][g];
+                    auto& nvec = neg_g[s][g];
+                    if (pvec.empty() || nvec.empty()) continue;
+                    size_t ip = (size_t)(fast_rng(rng_s) % pvec.size());
+                    size_t jn = (size_t)(fast_rng(rng_s) % nvec.size());
+                    int i = pvec[ip];
+                    int j = nvec[jn];
+
+                    int64_t dac = 0, dflat = 0;
+                    bool accept = false;
+                    if (wf > 0.0) {
+                        st.eval_swap_pos_neg_flat(s, i, j, dac, dflat);
+                        int64_t new_ac = st.E_ac + dac;
+                        if (new_ac <= limit) {
+                            // Bias toward flatter sequences when moving sideways/uphill
+                            double score = (double)dac + wf * (double)dflat;
+                            if (new_ac < rec_E || score <= (double)(limit - st.E_ac)) accept = true;
+                        }
+                    } else {
+                        int64_t dg, da;
+                        st.eval_swap_pos_neg(s, i, j, dac, dg, da);
+                        if (st.E_ac + dac <= limit) accept = true;
+                    }
+
+                    if (accept) {
+                        st.apply_swap(s, i, j, dac, dac, 0);
+                        st.E_flat += dflat;
+                        pvec[ip] = j;
+                        nvec[jn] = i;
+                        if (st.E_ac < rec_E) {
+                            rec_E = st.E_ac;
+                            limit = rec_E + delta;
+                            if (st.E_ac < best_E) {
+                                best_E = st.E_ac;
+                                for (int q = 0; q < 4; ++q) best_seq[q] = st.seq[q];
+                                record_if_best(tid, "RRT", prob, st, t0, out_path);
+                                if (g_found.load(std::memory_order_relaxed)) return;
+                            }
+                        }
+                    }
+                }
+                g_pt_steps.fetch_add(BLOCK, std::memory_order_relaxed);
+            }
+        }
+        ++cycle;
+    }
+}
+
 static std::vector<int> parse_int_list(const std::string& s) {
     std::vector<int> res;
     size_t p = 0;
@@ -1938,8 +2240,9 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: " << argv[0]
                   << " <m> <g|g1,g2,...> <b> <seconds> <out.json> [threads=2] [s0 s1 s2 s3]"
                   << " [--gens=g1,g2,...] [--ts=s0,s1,s2,s3] [--w_row=64] [--w_alt=16]"
-                  << " [--lock_row=0|1] [--flat_init=0|1] [--target_alt=a0,a1,a2,a3]"
-                  << " [--mode=hybrid|ils|pt] [--gls=1|0] [--save_best=<path>] [--two_opt_thresh=2000]\n";
+                  << " [--lock_row=0|1] [--flat_init=0|1] [--w_flat=0.0] [--sa_thi=220] [--sa_tlo=10]"
+                  << " [--target_alt=a0,a1,a2,a3] [--mode=hybrid|ils|pt|sa|rrt] [--gls=1|0]"
+                  << " [--save_best=<path>] [--two_opt_thresh=2000]\n";
         return 1;
     }
     int m = std::stoi(argv[1]);
@@ -1955,6 +2258,9 @@ int main(int argc, char** argv) {
     int64_t w_alt = 16;
     bool lock_row = false;
     bool flat_init = false;
+    double w_flat = 0.0;
+    double sa_thi = 220.0;
+    double sa_tlo = 10.0;
     std::string mode = "hybrid";
     bool use_gls = true;
 
@@ -1965,6 +2271,12 @@ int main(int argc, char** argv) {
             w_row = std::stoll(a.substr(8));
         } else if (a.rfind("--w_alt=", 0) == 0) {
             w_alt = std::stoll(a.substr(8));
+        } else if (a.rfind("--w_flat=", 0) == 0) {
+            w_flat = std::stod(a.substr(9));
+        } else if (a.rfind("--sa_thi=", 0) == 0) {
+            sa_thi = std::stod(a.substr(9));
+        } else if (a.rfind("--sa_tlo=", 0) == 0) {
+            sa_tlo = std::stod(a.substr(9));
         } else if (a.rfind("--lock_row=", 0) == 0) {
             lock_row = (std::stoi(a.substr(11)) != 0);
         } else if (a.rfind("--flat_init=", 0) == 0) {
@@ -2019,6 +2331,7 @@ int main(int argc, char** argv) {
               << ", w_row=" << prob.w_row << ", w_alt=" << prob.w_alt
               << ", lock_row=" << (prob.lock_row ? 1 : 0)
               << ", flat_init=" << (prob.flat_init ? 1 : 0)
+              << ", w_flat=" << w_flat
               << ", 2opt_th=" << g_two_opt_thresh
               << ", mode=" << mode << ", gls=" << (use_gls ? 1 : 0);
 #ifdef __AVX2__
@@ -2037,8 +2350,11 @@ int main(int argc, char** argv) {
     uint64_t base_seed = (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
     for (int t = 0; t < threads; ++t) {
         uint64_t seed = base_seed + 1000003ULL * t;
-        bool run_pt = (mode == "pt") || (mode == "hybrid" && (t & 1) == 1);
-        if (run_pt) {
+        if (mode == "sa") {
+            pool.emplace_back(worker_sa, t, std::cref(prob), secs, w_flat, sa_thi, sa_tlo, out_path, seed);
+        } else if (mode == "rrt") {
+            pool.emplace_back(worker_rrt, t, std::cref(prob), secs, w_flat, out_path, seed);
+        } else if (mode == "pt" || (mode == "hybrid" && (t & 1) == 1)) {
             pool.emplace_back(worker_pt, t, std::cref(prob), secs, out_path, seed);
         } else {
             pool.emplace_back(worker_gls_ils, t, std::cref(prob), secs, use_gls, out_path, seed);
