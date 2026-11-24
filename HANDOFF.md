@@ -3,6 +3,39 @@
 ## Goal
 Find a previously unknown Hadamard matrix of open order $n \le 10{,}000$ (live list of 85 open orders from https://www.math74.com/Hadamard/, updating `arXiv:2610.27175v1`), verify it independently over exact integers, and formally prove its existence in Lean 4 + Mathlib (0 `sorry`, 0 `native_decide`).
 
+## Resume here
+
+**Status as of 24 November 2026.** No previously open order has been
+settled. One verified matrix settles its order. The general Hadamard
+conjecture asks for existence at every positive multiple of four. Lean
+already proves the Goethals–Seidel construction theorems and verifies
+the published order-1948 witness. A new order still needs a witness
+that satisfies the applicable construction's hypotheses.
+
+1. **Prioritize the joint compression at order 7180, `g=29`.** Use
+   `python3 analyze_7180_joint.py` to reproduce the exclusion of one
+   modulus-46 witness. Its modulus-78 lift would need total squared norm
+   7088 and combined periodic autocorrelation −92 at shift 39. A
+   separate sample passed both tests. Next, extend the shared CRT
+   orbit constraints to more shift representatives. Require both
+   compressed views to come from the same orbit signs, and track
+   which cases are exhausted and which hit a cap. A complete
+   exclusion would concern this multiplier family. The earlier
+   order-6236, `g=119` exclusion gives a worked example in
+   `decompress_r54.py`.
+2. **Use pair matching for order 4412, `g=749`.** The exact scans
+   ruled out all four single-row replacements of the saved
+   `E=864` candidate under its order-19 symmetry. Search across
+   independent pools of sequence pairs with `solver_v3 --mode=mitm`.
+   Calibrate pool generation and matching on known order 1948.
+   The published witness passed as an injected control. A blind
+   rediscovery is still an open calibration milestone.
+3. **Verify any new candidate end to end.** Save the generating
+   sequences, run `verify.py` for Goethals–Seidel or the applicable
+   construction-specific verifier, and certify the compact witness
+   in Lean. See [Session 4 results](#session-4-results) for the
+   exact claims and reproduction commands.
+
 ## What Is Built & Verified
 
 1. **Lean 4 Formalization (`lean/HadamardTheorem5.lean`)**
