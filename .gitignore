@@ -1,5 +1,6 @@
 solver
 solver_v2
+solver_v3
 *.o
 __pycache__/
 *.pyc
