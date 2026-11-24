@@ -8,9 +8,15 @@ import Mathlib.Tactic.Ring
 import Mathlib.Tactic.Linarith
 
 /-!
-# Theorem 5: Bordered Goethals-Seidel Construction of Hadamard Matrices
+# Goethals-Seidel constructions of Hadamard matrices
 
-This file formalizes Theorem 5 of arXiv:2610.27175v1:
+This file formalizes Theorems 3 and 5 of arXiv:2610.27175v1.
+
+For the unbordered construction (Theorem 3), four ±1 vectors
+`a, b, c, d : Fin m → ℤ` whose periodic autocorrelations sum to zero at every
+nonzero shift yield a Hadamard matrix of order `4m`.
+
+For the even-length bordered construction (Theorem 5):
 Given `m > 0` and four ±1 vectors `a, b, c, d : Fin m → ℤ` with row sums `(2, 0, 0, 0)` and
 periodic autocorrelation sum equal to `-4` for all nonzero shifts `s : Fin m`, the explicitly
 constructed `(4m + 4) × (4m + 4)` bordered Goethals-Seidel matrix `H` has all entries in `{1, -1}`
@@ -222,7 +228,7 @@ def GS_block (a b c d : Fin m → ℤ) : Fin 4 → Fin 4 → Matrix (Fin m) (Fin
   | 3, 2 => -((circ b)ᵀ * backDiag m)
   | 3, 3 => circ a
 
-/-- Bottom-right 4m × 4m Goethals-Seidel matrix `G`. -/
+/-- The 4m × 4m Goethals-Seidel matrix, used as the bottom-right block in Theorem 5. -/
 def G (a b c d : Fin m → ℤ) : Matrix (Fin 4 × Fin m) (Fin 4 × Fin m) ℤ :=
   Matrix.of fun p q => GS_block a b c d p.1 q.1 p.2 q.2
 
@@ -377,16 +383,17 @@ private lemma G_mul_G_transpose_apply (a b c d : Fin m → ℤ) (r c' : Fin 4) (
   rw [hmul, G_mul_G_transpose_block]
   split_ifs <;> rfl
 
-private lemma circ_sum_autocorr {a b c d : Fin m → ℤ}
+private lemma circ_sum_autocorr {a b c d : Fin m → ℤ} {target : ℤ}
     (ha : ∀ i, a i = 1 ∨ a i = -1)
     (hb : ∀ i, b i = 1 ∨ b i = -1)
     (hc : ∀ i, c i = 1 ∨ c i = -1)
     (hd : ∀ i, d i = 1 ∨ d i = -1)
     (hauto : ∀ s : Fin m, s ≠ 0 →
-      ∑ i : Fin m, (a i * a (i + s) + b i * b (i + s) + c i * c (i + s) + d i * d (i + s)) = -4)
+      ∑ i : Fin m, (a i * a (i + s) + b i * b (i + s) + c i * c (i + s) + d i * d (i + s)) =
+        target)
     (i j : Fin m) :
     (circ a * (circ a)ᵀ + circ b * (circ b)ᵀ + circ c * (circ c)ᵀ + circ d * (circ d)ᵀ) i j =
-      if i = j then (4 * m : ℤ) else -4 := by
+      if i = j then (4 * m : ℤ) else target := by
   simp only [Matrix.add_apply, circ_mul_transpose_apply]
   rw [← Finset.sum_add_distrib, ← Finset.sum_add_distrib, ← Finset.sum_add_distrib]
   by_cases hij : i = j
@@ -416,6 +423,36 @@ private lemma bottom_right_block {a b c d : Fin m → ℤ}
   rw [W_mul_W_transpose_apply, G_mul_G_transpose_apply, circ_sum_autocorr ha hb hc hd hauto]
   by_cases hrc : r = c' <;> by_cases hij : i = j <;> simp [hrc, hij] ; ring
 
+private lemma G_entries {a b c d : Fin m → ℤ}
+    (ha : ∀ i, a i = 1 ∨ a i = -1)
+    (hb : ∀ i, b i = 1 ∨ b i = -1)
+    (hc : ∀ i, c i = 1 ∨ c i = -1)
+    (hd : ∀ i, d i = 1 ∨ d i = -1)
+    (p q : Fin 4 × Fin m) :
+    G a b c d p q = 1 ∨ G a b c d p q = -1 := by
+  obtain ⟨r, i⟩ := p
+  obtain ⟨c', j⟩ := q
+  simp only [G, Matrix.of_apply]
+  fin_cases r <;> fin_cases c' <;>
+    simp only [GS_block, Matrix.neg_apply, mul_backDiag_apply,
+      Matrix.transpose_apply, circ_apply]
+  · exact ha _
+  · exact hb _
+  · exact hc _
+  · exact hd _
+  · exact pm_one_neg (hb _)
+  · exact ha _
+  · exact hd _
+  · exact pm_one_neg (hc _)
+  · exact pm_one_neg (hc _)
+  · exact pm_one_neg (hd _)
+  · exact ha _
+  · exact hb _
+  · exact pm_one_neg (hd _)
+  · exact hc _
+  · exact pm_one_neg (hb _)
+  · exact ha _
+
 private lemma H_block_entries {a b c d : Fin m → ℤ}
     (ha : ∀ i, a i = 1 ∨ a i = -1)
     (hb : ∀ i, b i = 1 ∨ b i = -1)
@@ -442,28 +479,7 @@ private lemma H_block_entries {a b c d : Fin m → ℤ}
       dsimp only
       fin_cases r <;> fin_cases c' <;> decide
     | inr q =>
-      simp only [H_block, Matrix.fromBlocks_apply₂₂, G, Matrix.of_apply]
-      obtain ⟨r, i⟩ := p
-      obtain ⟨c', j⟩ := q
-      fin_cases r <;> fin_cases c' <;>
-        simp only [GS_block, Matrix.neg_apply, mul_backDiag_apply,
-          Matrix.transpose_apply, circ_apply]
-      · exact ha _
-      · exact hb _
-      · exact hc _
-      · exact hd _
-      · exact pm_one_neg (hb _)
-      · exact ha _
-      · exact hd _
-      · exact pm_one_neg (hc _)
-      · exact pm_one_neg (hc _)
-      · exact pm_one_neg (hd _)
-      · exact ha _
-      · exact hb _
-      · exact pm_one_neg (hd _)
-      · exact hc _
-      · exact pm_one_neg (hb _)
-      · exact ha _
+      exact G_entries ha hb hc hd p q
 
 private lemma H_block_mul_transpose {a b c d : Fin m → ℤ}
     (ha : ∀ i, a i = 1 ∨ a i = -1)
@@ -486,6 +502,48 @@ private lemma H_block_mul_transpose {a b c d : Fin m → ℤ}
   simp only [smul_zero]
 
 end BlockConstruction
+
+/-- The explicit `4m × 4m` unbordered Goethals-Seidel matrix. -/
+def H_unbordered {m : ℕ} [NeZero m] (a b c d : Fin m → ℤ) :
+    Matrix (Fin (4 * m)) (Fin (4 * m)) ℤ :=
+  Matrix.reindex finProdFinEquiv finProdFinEquiv (G a b c d)
+
+/-- **Theorem 3 (Goethals-Seidel Hadamard Matrix)**:
+Four ±1 sequences whose periodic autocorrelations sum to zero at every nonzero shift
+give a Hadamard matrix of order `4m`. -/
+theorem goethals_seidel_hadamard
+    {m : ℕ} [NeZero m]
+    (a b c d : Fin m → ℤ)
+    (ha : ∀ i, a i = 1 ∨ a i = -1)
+    (hb : ∀ i, b i = 1 ∨ b i = -1)
+    (hc : ∀ i, c i = 1 ∨ c i = -1)
+    (hd : ∀ i, d i = 1 ∨ d i = -1)
+    (hauto : ∀ s : Fin m, s ≠ 0 →
+      ∑ i : Fin m, (a i * a (i + s) + b i * b (i + s) + c i * c (i + s) + d i * d (i + s)) =
+        0) :
+    (∀ i j, H_unbordered a b c d i j = 1 ∨ H_unbordered a b c d i j = -1) ∧
+    H_unbordered a b c d * (H_unbordered a b c d)ᵀ =
+      ((4 * m : ℤ) • (1 : Matrix (Fin (4 * m)) (Fin (4 * m)) ℤ)) := by
+  constructor
+  · intro i j
+    exact G_entries ha hb hc hd (finProdFinEquiv.symm i) (finProdFinEquiv.symm j)
+  · have hgram : G a b c d * (G a b c d)ᵀ =
+        ((4 * m : ℤ) • (1 : Matrix (Fin 4 × Fin m) (Fin 4 × Fin m) ℤ)) := by
+      ext ⟨r, i⟩ ⟨c', j⟩
+      simp only [Matrix.smul_apply, Matrix.one_apply, smul_eq_mul, Prod.mk.injEq]
+      rw [G_mul_G_transpose_apply, circ_sum_autocorr ha hb hc hd hauto]
+      by_cases hrc : r = c' <;> by_cases hij : i = j <;> simp [hrc, hij]
+    have hmul : H_unbordered a b c d * (H_unbordered a b c d)ᵀ =
+        Matrix.reindex finProdFinEquiv finProdFinEquiv (G a b c d * (G a b c d)ᵀ) := by
+      ext i j
+      simp only [H_unbordered, Matrix.reindex_apply, Matrix.submatrix_apply,
+        Matrix.mul_apply, Matrix.transpose_apply]
+      exact Equiv.sum_comp finProdFinEquiv.symm
+        (fun k => G a b c d (finProdFinEquiv.symm i) k * G a b c d (finProdFinEquiv.symm j) k)
+    rw [hmul, hgram]
+    ext i j
+    simp only [Matrix.reindex_apply, Matrix.submatrix_apply, Matrix.smul_apply,
+      Matrix.one_apply, smul_eq_mul, EmbeddingLike.apply_eq_iff_eq]
 
 /-- **Theorem 5 (Bordered Goethals-Seidel Hadamard Matrix)**:
 Given `m > 0` (`[NeZero m]`) and four ±1 vectors `a, b, c, d : Fin m → ℤ` with row sums
@@ -523,5 +581,25 @@ theorem bordered_goethals_seidel_hadamard
     ext i j
     simp only [Matrix.reindex_apply, Matrix.submatrix_apply, Matrix.smul_apply, Matrix.one_apply,
       smul_eq_mul, Equiv.symm_symm, EmbeddingLike.apply_eq_iff_eq]
+
+/-- A concrete unbordered witness, checked by kernel reduction. -/
+theorem hadamard_order_twelve :
+    ∃ M : Matrix (Fin 12) (Fin 12) ℤ,
+      (∀ i j, M i j = 1 ∨ M i j = -1) ∧
+      M * Mᵀ = (12 : ℤ) • (1 : Matrix (Fin 12) (Fin 12) ℤ) := by
+  let a : Fin 3 → ℤ := fun _ => 1
+  let b : Fin 3 → ℤ := fun i => if i = 0 then -1 else 1
+  refine ⟨H_unbordered a b b b, ?_⟩
+  refine goethals_seidel_hadamard a b b b ?_ ?_ ?_ ?_ ?_
+  · intro i
+    exact Or.inl rfl
+  · intro i
+    fin_cases i <;> decide +revert
+  · intro i
+    fin_cases i <;> decide +revert
+  · intro i
+    fin_cases i <;> decide +revert
+  · intro s
+    fin_cases s <;> decide +revert
 
 end HadamardTheorem5
