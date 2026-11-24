@@ -29,6 +29,7 @@ import json
 import time
 from collections import defaultdict
 from fractions import Fraction
+from itertools import product
 from math import gcd
 
 from check_composites_v2 import (
@@ -221,7 +222,7 @@ def get_all_d_quads(n, m, g, d):
     return U, orbits, cosets, shift_reps, paf_mats, quads
 
 
-def lift_d_to_2d(n, m, g, d):
+def lift_d_to_2d(n, m, g, d, visit_lift=None):
     if n != 4*m + 4 or m % 4 != 2 or d <= 1 or d % 2 != 1 or m % (2*d) or gcd(m, g) != 1:
         raise ValueError("Expected n=4*m+4, odd m/2, odd divisor d>1 of m/2, and a unit g")
 
@@ -319,7 +320,8 @@ def lift_d_to_2d(n, m, g, d):
     def encode_cache(cache):
         return {
             a: [
-                (paf[0], sum(x*y for x, y in zip(paf, multipliers)), len(lifts), lifts[0])
+                (paf[0], sum(x*y for x, y in zip(paf, multipliers)), len(lifts),
+                 lifts if visit_lift else lifts[:1])
                 for paf, lifts in sorted(paf_map.items())
             ]
             for a, paf_map in cache.items()
@@ -379,7 +381,12 @@ def lift_d_to_2d(n, m, g, d):
                     if sample_2d_witness is None:
                         _, b1, b2 = matches[0]
                         bs = (b3, b4, b1, b2) if swapped else (b1, b2, b3, b4)
-                        sample_2d_witness = tuple(zip((a1, a2, a3, a4), bs))
+                        sample_2d_witness = tuple(zip((a1, a2, a3, a4), (b[0] for b in bs)))
+                    if visit_lift:
+                        for _, b1, b2 in matches:
+                            bs = (b3, b4, b1, b2) if swapped else (b1, b2, b3, b4)
+                            for lifts in product(*bs):
+                                visit_lift(tuple(zip((a1, a2, a3, a4), lifts)))
         if q_paf_hits > 0:
             surviving_d_quads += 1
             total_2d_paf_quads += q_paf_hits
@@ -420,10 +427,76 @@ def lift_d_to_2d(n, m, g, d):
     return None
 
 
+def check_6236_joint_compression():
+    """Check every mod-38 lift against the exact mod-82 energy constraint."""
+    n = 6236
+    m, g, d = TARGETS[n]
+    q = 41
+    group = generate_subgroup(m, [g])
+    orbits = get_orbits_U(m, group)
+    mod_d = sorted(tuple(o) for o in get_orbits_U(d, {u % d for u in group}))
+    mod_q = sorted(tuple(o) for o in get_orbits_U(q, {u % q for u in group}))
+
+    # Certify the product partition in each parity half. The three rows
+    # have sizes 1,9,9 and the nine columns have sizes 1,5,...,5.
+    if [len(o) for o in mod_d] != [1, 9, 9] or [len(o) for o in mod_q] != [1] + [5]*8:
+        raise RuntimeError("Unexpected CRT orbit sizes")
+    full_partition = {
+        frozenset(x for x in range(m) if x % 2 == parity and x % d in row and x % q in col)
+        for parity, row, col in product(range(2), mod_d, mod_q)
+    }
+    if full_partition != {frozenset(o) for o in orbits}:
+        raise RuntimeError("Full orbits differ from the CRT product partition")
+
+    # A mod-82 coordinate is x=s+18t, where s is the sign of the first
+    # CRT row and t is half the sum of the other two signs. Thus t is
+    # -1, 0 or 1. Summing x² gives 8*q + 36*(9*A+B), where
+    # A=sum t², B=sum s*t count all coordinates. Since |B|<=A,
+    # the required mod-82 energy bounds A.
+    energy_delta = n - 4*(m // (2*q)) - 8*q
+    if energy_delta % 36:
+        raise RuntimeError("Unexpected mod-82 energy congruence")
+    scaled_energy = energy_delta // 36
+    min_a = (scaled_energy + 9) // 10
+    max_a = scaled_energy // 8
+
+    checked = survivors = 0
+    progressions = set()
+
+    def visit(lift):
+        nonlocal checked, survivors
+        checked += 1
+        min_weight = 0
+        for a, b in lift:
+            for parity in (1, -1):
+                # A mod-38 coordinate is the weighted sum of one CRT row.
+                # Its mod-5 residue determines the sign in column zero.
+                x, y = ((a[i] + parity*b[i]) // 2 for i in (1, 2))
+                signs = [next(sign for sign in (-1, 1) if sign % 5 == v % 5) for v in (x, y)]
+                t0 = sum(signs) // 2
+                total, rem = divmod((x + y) // 2 - t0, 5)
+                if rem:
+                    raise RuntimeError("CRT row totals are inconsistent")
+                # Among the eight columns of size five, the number of
+                # nonzero t values has the parity of their sum and is at
+                # least its absolute value.
+                min_weight += abs(t0) + 5*abs(total)
+
+        progressions.add((min_weight, min_weight % 10))
+        if any(a >= min_weight and (a - min_weight) % 10 == 0 for a in range(min_a, max_a + 1)):
+            survivors += 1
+
+    witness = lift_d_to_2d(n, m, g, d, visit_lift=visit)
+    print(f"  Joint mod-82 Parseval check: {survivors}/{checked} mod-38 lifts survive.", flush=True)
+    print(f"  Mod-82 energy requires {min_a} <= A <= {max_a}. Mod-38 progression(s) "
+          f"(lower bound, residue mod 10): {sorted(progressions)}.", flush=True)
+    return witness
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0].strip())
     parser.add_argument("orders", nargs="*", type=int, help="orders to test (default: 9388 and 7180)")
-    parser.add_argument("--witness-out", help="write the verified compressed witness for a single order")
+    parser.add_argument("--witness-out", help="write a verified 2d-compressed witness for a single order, if one exists")
     args = parser.parse_args()
     orders = args.orders or [9388, 7180]
     if any(n not in TARGETS for n in orders):
@@ -433,7 +506,7 @@ def main():
 
     self_test_2d_identity()
     for n in orders:
-        witness = lift_d_to_2d(n, *TARGETS[n])
+        witness = check_6236_joint_compression() if n == 6236 else lift_d_to_2d(n, *TARGETS[n])
         if args.witness_out and witness:
             with open(args.witness_out, "w") as output:
                 json.dump(witness, output)
