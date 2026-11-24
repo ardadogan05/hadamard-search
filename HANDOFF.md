@@ -211,3 +211,21 @@ for row in 1 2 3 4; do
   /tmp/scan_binary_4412 "/tmp/4412-row-$row.txt"
 done
 ```
+
+## Session 5 results
+
+No previously unknown Hadamard order was settled. All results below are internal engineering progress, quantitative scaling bounds, or bounded scans.
+
+- **Order `7180, g=29` joint `(mod 46, mod 78)` compression (`analyze_7180_full.py`, `analyze_7180_full.cpp`).**
+  - Exhaustively enumerated all **114,205,977** canonical `mod-46` witnesses across all 845 canonical `mod-23` quads (in 22.1s on 1 core): **62,337,312** (54.58%) are excluded by `mod-78` energy (`7088`), leaving **51,868,665** (45.42%) energy-survivors.
+  - Stratified all-11-shift `mod-78` scan across all 845 quads (`--per-quad-cap 5`, 4,225 energy-survivors, 133.5s): 2,831 died at `even_26`, 136 at `even_6`, 828 at `odd_39`, 100 at `odd_13`, 229 at `joint_even`, 17 at `joint_all11`, **0** survived all 11 shifts, and 84 hit the 2M pair cap (`INCONCLUSIVE_CAPPED`). A 10,000-witness deep scan on quad 0 also found 0 all-11 survivors (10 capped).
+  - Global `Z_6`-fiber convolution on shifts `{0, 13, 26, 39}` is feasible (`k = 0..4`), so there is no pure `Z_6` obstruction analogous to `6236 g=119`. **Family status: INCONCLUSIVE** (not globally excluded due to 51.8M energy-survivors).
+  - Cross-checked via `python3 analyze_7180_full.py --self-test` (exact CRT partition + all 11 bilinear shift forms + `MOD46_WITNESS`) and an independent 104-witness pure-Python sample.
+- **Pair-matching (`solver_v3 --mode=mitm`) calibration on `1948` and `4412`.**
+  - Added AVX2 single-row Tabu flatness (`--mitm_tabu_steps`), AVX2 pair-flatness filtering (`--mitm_pair_flat_max`, 37–47M pairs/s on 1 core), and compact 16-byte `MitmPair`. Injected `1948` control verified in `0.51s` (`verify.py` exact pass).
+  - Measured `fixtures/published_1948.json` flatness $\Phi_f \in [0.124, 0.138]$ (`F ∈ [1627, 1819]`). Single-row Tabu reaches $\Phi_f \approx 0.056$ (`1948`) and `0.063` (`4412`), but exact collision-rate scaling $p_{\text{hit}}(F) \approx \sqrt{K} (\pi F / (2K))^{-(K-1)/2}$ shows blind 2+2 MITM at $\Phi_f \approx 0.061$ still requires $P \approx 15\text{k}$ rows ($\sim 10^{9.8}$ pairs/side) on `1948` and $P \approx 7 \times 10^5$ rows ($\sim 10^{13.15}$ pairs/side) on `4412` — **not feasible via pure blind 2+2 MITM on a 2-core VM**.
+- **`T`-matrix search (`tmatrix_solver.cpp`, `tmatrix_mitm.cpp`) & composite/Legendre scans.**
+  - Upgraded `tmatrix_solver.cpp` with fused AVX2 Move 1+3 evaluators (`111k` full Tabu iters/s at `t=151`, `47.5k` at `t=463`, `3.8×` speedup), assignment-based Tabu, 2-move low-`E` polish, and 2-matrix LNS: `t=163` hits `E=0` in `0.45s` (`verify_tmatrix.py` exact pass), `t=151` reaches `E=2` in `14.6s` (distinct `E<=4` rate `0.53/s` vs `#(E=4)/#(E=0) = 8,190`), and open `t=463` (`K=21`, targeting `H(9260)` via Cooper–Wallis `WT(5)`) reaches `E=28` in `80.7s` (still short of `E=0`).
+  - Built `tmatrix_mitm.cpp` and proved via exact multinomial counting that fixing a single `(20, 22)` orbit partition at `t=463` drops `~5.4 × 10^6` total solutions to `2.4 × 10^{-6}` expected solutions per partition, ruling out fixed-partition 2+2 MITM at `t=463`.
+  - Exact `q`-compression ruled out all 6 composite `T`-matrix candidates from `scan_tmatrices.py`; a cyclic Theorem 4 (Legendre pair, `r <= 60`) scan across `UNKNOWN_85` found 0 prime $\ell = (n-2)/2$ and ruled out 1,594 / 1,597 families (3 survivors at `K = 28..31`).
+
