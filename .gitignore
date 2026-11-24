@@ -1,0 +1,7 @@
+solver
+solver_v2
+*.o
+__pycache__/
+*.pyc
+lean/.lake/
+test_*.json
