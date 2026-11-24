@@ -112,14 +112,158 @@ class OrbitMoments:
         return signs
 
 
+class BinaryOrbitProjection:
+    """Generate fourth-row candidates by a characteristic-two norm equation.
+
+    Use the minus supports D_i. Their four difference counts sum to
+    p*delta_0 + (sum_i |D_i| - p)*1. At a primitive p-th root zeta in
+    characteristic two the constant vector vanishes, leaving
+    sum_i D_i(zeta)*D_i(zeta^-1) = 1.
+
+    The multiplier and Frobenius (x -> x²) give two orbits on nonzero
+    frequencies, exchanged by inversion. Over F_2, the multiplier-fixed
+    algebra therefore has factors F_2 at 1 and two fields of degree q/2
+    at zeta and zeta^-1. The evaluation map is inverted by binary Gaussian
+    elimination. The fourth row's size fixes its evaluation at 1. Its
+    remaining norm is fixed by the other rows, so any nonzero choice for
+    one field component determines the opposite component by division.
+    The zero norm permits either component to vanish. Row size and exact
+    integer PAF must still be checked after this modular reduction.
+    """
+
+    # Irreducible polynomials with degrees ord_p(2), encoded as bit masks.
+    MODULI = {
+        1103: 0x20000005,
+        487: 0xD85EA17C286ABB83052F4B898DB4C3BB531B7E1B8666E18E4F005623C3A81,
+    }
+
+    def __init__(self, model):
+        if model.p not in self.MODULI:
+            raise ValueError('binary projection supports prime lengths 487 and 1103')
+        self.model = model
+        self.modulus = self.MODULI[model.p]
+        self.degree = self.modulus.bit_length() - 1
+        exponent = ((1 << self.degree) - 1) // model.p
+        root = self.power(2, exponent)
+        if root == 1 or self.power(root, model.p) != 1:
+            raise ValueError('field generator did not give a primitive p-th root')
+        roots = [1]
+        for _ in range(1, model.p):
+            roots.append(self.multiply(roots[-1], root))
+        self.columns = []
+        self.pivots = {}
+        forward_pivots = {}
+        for i, orbit in enumerate(model.orbits):
+            a = b = 0
+            for x in orbit:
+                a ^= roots[x]
+                b ^= roots[-x % model.p]
+            self.columns.append((a, b))
+            self._insert(forward_pivots, a, 1 << i)
+            if not self._insert(self.pivots, self._pack(1, a, b), 1 << i):
+                raise ValueError('projection is not injective on orbit signs')
+        self.forward_rank = len(forward_pivots)
+        if self.forward_rank != model.q // 2:
+            raise ValueError('expected two field factors of degree q/2')
+
+    @staticmethod
+    def _insert(pivots, vector, mask):
+        while vector:
+            bit = vector.bit_length() - 1
+            if bit not in pivots:
+                pivots[bit] = vector, mask
+                return True
+            pivot, origin = pivots[bit]
+            vector ^= pivot
+            mask ^= origin
+        return False
+
+    def multiply(self, a, b):
+        product = 0
+        high_bit = 1 << self.degree
+        while b:
+            if b & 1:
+                product ^= a
+            b >>= 1
+            a <<= 1
+            if a & high_bit:
+                a ^= self.modulus
+        return product
+
+    def power(self, base, exponent):
+        result = 1
+        while exponent:
+            if exponent & 1:
+                result = self.multiply(result, base)
+            base = self.multiply(base, base)
+            exponent >>= 1
+        return result
+
+    def _pack(self, parity, forward, backward):
+        return parity | (forward << 1) | (backward << (self.degree + 1))
+
+    def project(self, signs):
+        if len(signs) != len(self.columns) or any(type(sign) is not int or sign not in (-1, 1) for sign in signs):
+            raise ValueError(f'expected {len(self.columns)} signs in orbit order')
+        forward = backward = 0
+        for sign, (a, b) in zip(signs, self.columns):
+            if sign == -1:
+                forward ^= a
+                backward ^= b
+        return forward, backward
+
+    def remaining_norm(self, other_rows):
+        if len(other_rows) != 3:
+            raise ValueError('expected three complete rows')
+        norm = 1
+        for row in other_rows:
+            a, b = self.project(row)
+            norm ^= self.multiply(a, b)
+        return norm
+
+    def complete(self, norm, projection, row_sum, *, reverse=False):
+        """Complete one projection. At zero norm try both orientations."""
+        size = (self.model.p - row_sum) // 2
+        if not 0 <= size <= self.model.p or row_sum != self.model.p - 2 * size or (norm and not projection):
+            return None
+        if not 0 <= projection < 1 << self.degree:
+            return None
+        # Both components inhabit the same subfield, so inversion can use
+        # its order even when the ambient field is larger.
+        other = self.multiply(norm, self.power(projection, (1 << self.forward_rank) - 2)) if norm else 0
+        forward, backward = (other, projection) if reverse else (projection, other)
+        if self.multiply(forward, backward) != norm:
+            return None
+        value = self._pack(size % 2, forward, backward)
+        mask = 0
+        while value:
+            pivot = self.pivots.get(value.bit_length() - 1)
+            if pivot is None:
+                return None
+            basis, origin = pivot
+            value ^= basis
+            mask ^= origin
+        signs = [-1 if mask >> i & 1 else 1 for i in range(self.model.q + 1)]
+        if signs[0] + self.model.h * sum(signs[1:]) == row_sum:
+            return signs
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('candidate', type=Path, nargs='?', help='optional b=0 candidate JSON')
     parser.add_argument('--row', type=int, choices=range(1, 5), default=1, help='row to complete (1–4)')
+    parser.add_argument('--binary', action='store_true', help='complete from one binary field projection')
     args = parser.parse_args()
     if args.candidate is None:
         model = OrbitMoments(1103, 749)
-        print(f'n=4412, h={model.h}, q={model.q}: {model.q // 2} even coefficients determined by the three other rows and remaining odd part')
+        if args.binary:
+            binary = BinaryOrbitProjection(model)
+            projection_count = 1 << binary.forward_rank
+            print(f'n=4412, h={model.h}, q={model.q}: two {binary.forward_rank}-bit projections')
+            print(f'Fourth-row bounds before size and PAF checks: {projection_count - 1} at nonzero norm, {2 * projection_count - 1} at zero norm.')
+        else:
+            print(f'n=4412, h={model.h}, q={model.q}: {model.q // 2} even coefficients determined by the three other rows and remaining odd part')
         return 0
 
     data = json.loads(args.candidate.read_text())
@@ -130,6 +274,18 @@ def main():
     row = rows[args.row - 1]
     others = rows[:args.row - 1] + rows[args.row:]
     row_sum = row[0] + model.h * sum(row[1:])
+    if args.binary:
+        binary = BinaryOrbitProjection(model)
+        forward, backward = binary.project(row)
+        norm = binary.remaining_norm(others)
+        completed = binary.complete(norm, forward or backward, row_sum, reverse=(forward == 0))
+        if completed is None:
+            print(f'No row-size-compatible binary completion for row {args.row}.')
+            return 1
+        print(f'Binary candidate for row {args.row} with row sum {row_sum}. Verify its integer PAF to establish a solution.')
+        print(json.dumps(completed))
+        return 0
+
     completed = model.complete(others, model.encode(row)[1::2], row_sum)
     if completed is None:
         print(f'No signed completion for row {args.row} with the supplied odd moments and row sum {row_sum}.')
